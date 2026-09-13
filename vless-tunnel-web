@@ -1,0 +1,219 @@
+#!/usr/bin/ucode
+// /www/cgi-bin/vless-tunnel — минимальная веб-страница управления.
+// Не LuCI-приложение: отдельный самостоятельный CGI-скрипт на uhttpd,
+// тонкая обёртка над уже готовым /usr/bin/vless-tunnel — вся логика
+// (парсинг, генерация конфига, procd) остаётся там, здесь только форма.
+//
+// Аутентификации нет: доступ ограничен доверенной LAN, как и у прочих
+// сервисов роутера без отдельного пароля.
+
+import * as fs from 'fs';
+
+const VT = '/usr/bin/vless-tunnel';
+
+function hex_val(c) {
+	let o = ord(c);
+	if (o >= 48 && o <= 57) return o - 48;
+	if (o >= 97 && o <= 102) return o - 87;
+	if (o >= 65 && o <= 70) return o - 55;
+	return -1;
+}
+
+function form_decode(s) {
+	s = '' + (s ?? '');
+	let out = '';
+	let n = length(s);
+	for (let i = 0; i < n; i++) {
+		let c = substr(s, i, 1);
+		if (c == '+') { out += ' '; continue; }
+		if (c == '%' && i + 2 < n) {
+			let hi = hex_val(substr(s, i + 1, 1));
+			let lo = hex_val(substr(s, i + 2, 1));
+			if (hi >= 0 && lo >= 0) { out += chr(hi * 16 + lo); i += 2; continue; }
+		}
+		out += c;
+	}
+	return out;
+}
+
+function parse_form(body) {
+	let out = {};
+	for (let pair in split(body ?? '', '&')) {
+		if (!pair) continue;
+		let eq = index(pair, '=');
+		let k = eq >= 0 ? substr(pair, 0, eq) : pair;
+		let v = eq >= 0 ? substr(pair, eq + 1) : '';
+		out[form_decode(k)] = form_decode(v);
+	}
+	return out;
+}
+
+function esc(s) {
+	s = '' + (s ?? '');
+	s = replace(s, '&', '&amp;');
+	s = replace(s, '<', '&lt;');
+	s = replace(s, '>', '&gt;');
+	s = replace(s, '"', '&quot;');
+	return s;
+}
+
+function run(cmd) {
+	let p = fs.popen(cmd + ' 2>&1', 'r');
+	let out = p.read('all') ?? '';
+	let code = p.close();
+	return { code: code, out: out };
+}
+
+function shq(s) {
+	// одинарные кавычки для безопасной передачи ссылки в shell
+	return "'" + replace('' + (s ?? ''), "'", "'\\''") + "'";
+}
+
+function field(text, prefix) {
+	for (let line in split(text, '\n'))
+		if (index(line, prefix) == 0) return trim(substr(line, length(prefix)));
+	return null;
+}
+
+function line_with(text, needle) {
+	for (let line in split(text, '\n'))
+		if (index(line, needle) >= 0) return trim(line);
+	return null;
+}
+
+// Вывод команд может содержать ключ шифрования (ENCRYPTION=...) — вырезаем
+// перед показом на странице, ссылка и так уже сохранена в UCI на роутере.
+function redact(text) {
+	let out = [];
+	for (let line in split(text ?? '', '\n'))
+		push(out, index(line, 'ENCRYPTION=') == 0 ? 'ENCRYPTION=(скрыто)' : line);
+	return join('\n', out);
+}
+
+// --- обработка формы -----------------------------------------------------
+let method = getenv('REQUEST_METHOD');
+let action_result = null;
+
+if (method == 'POST') {
+	let body = fs.stdin.read('all');
+	let f = parse_form(body);
+	if (f.action == 'set-link' && trim(f.link || '')) {
+		action_result = run(VT + ' set-link ' + shq(trim(f.link)));
+	} else if (f.action == 'on') {
+		action_result = run(VT + ' on');
+	} else if (f.action == 'off') {
+		action_result = run(VT + ' off');
+	} else if (f.action == 'add-domain' && trim(f.domain || '')) {
+		action_result = run(VT + ' add-domain ' + shq(trim(f.domain)));
+	} else if (f.action == 'remove-domain' && trim(f.domain || '')) {
+		action_result = run(VT + ' remove-domain ' + shq(trim(f.domain)));
+	} else if (f.action == 'save-domains') {
+		let tmp = '/tmp/vless-tunnel-domains-edit.txt';
+		let w = fs.open(tmp, 'w');
+		w.write(f.domains ?? '');
+		w.close();
+		action_result = run(VT + ' _set-domains-file ' + shq(tmp));
+		fs.unlink(tmp);
+	}
+}
+
+// --- текущее состояние ----------------------------------------------------
+let status = run(VT + ' status').out;
+let enabled = field(status, 'enabled:') == 'да';
+let running_line = field(status, 'служба:');
+let running = running_line == 'работает';
+let has_link = index(status, 'ссылка не задана') < 0;
+let server = field(status, 'SERVER=');
+let port = field(status, 'SERVER_PORT=');
+let network = field(status, 'NETWORK=');
+let security = field(status, 'SECURITY=');
+let sni = field(status, 'SNI=');
+let routing_line = line_with(status, 'policy routing');
+
+// Список доменов для textarea читаем как есть (с комментариями) —
+// прямо из файла, путь берём из UCI, а не хардкодим: `vless-tunnel domains`
+// отдаёт уже очищенный список без комментариев, для редактирования нужен
+// именно исходный файл.
+let domains_path = trim(run('uci -q get vless-tunnel.main.domains').out) || '/etc/vless-tunnel/domains';
+let domains_raw = '';
+let domains_file = fs.open(domains_path, 'r');
+if (domains_file) { domains_raw = domains_file.read('all') ?? ''; domains_file.close(); }
+let domains_count = length(filter(split(domains_raw, '\n'), (l) => trim(replace(l, /#.*/, ''))));
+
+print('Content-Type: text/html; charset=utf-8\r\n\r\n');
+print('<!doctype html><html lang="ru"><head><meta charset="utf-8">');
+print('<meta name="viewport" content="width=device-width, initial-scale=1">');
+print('<title>vless-tunnel</title><style>');
+print('body{font-family:sans-serif;max-width:32rem;margin:1.5rem auto;padding:0 1rem;background:#f5f5f5;color:#222}');
+print('h1{font-size:1.3rem}');
+print('.card{background:#fff;border-radius:8px;padding:1rem 1.2rem;margin-bottom:1rem;box-shadow:0 1px 3px rgba(0,0,0,.1)}');
+print('.row{display:flex;justify-content:space-between;padding:.25rem 0;border-bottom:1px solid #eee;font-size:.95rem}');
+print('.row:last-child{border-bottom:none}');
+print('.badge{padding:.1rem .5rem;border-radius:4px;font-size:.85rem;font-weight:bold}');
+print('.on{background:#d4edda;color:#155724} .off{background:#f8d7da;color:#721c24}');
+print('input[type=text]{width:100%;box-sizing:border-box;padding:.5rem;font-size:1rem;margin:.5rem 0}');
+print('button{padding:.5rem 1rem;font-size:1rem;border:0;border-radius:6px;margin-right:.5rem;cursor:pointer}');
+print('.btn-on{background:#2e7d32;color:#fff} .btn-off{background:#c62828;color:#fff} .btn-save{background:#1565c0;color:#fff}');
+print('.btn-add{background:#1565c0;color:#fff} .btn-danger{background:#c62828;color:#fff}');
+print('pre{white-space:pre-wrap;word-break:break-all;background:#f0f0f0;padding:.5rem;border-radius:6px;font-size:.85rem}');
+print('textarea{width:100%;box-sizing:border-box;padding:.5rem;font-size:.9rem;font-family:monospace;margin:.5rem 0;min-height:16rem}');
+print('summary{cursor:pointer;font-size:.95rem;color:#1565c0;margin:.25rem 0}');
+print('.hint{font-size:.8rem;color:#777;margin:.25rem 0 0}');
+print('</style></head><body>');
+print('<h1>vless-tunnel</h1>');
+
+print('<div class="card">');
+print('<div class="row"><span>Туннель</span><span class="badge ' + (enabled ? 'on' : 'off') + '">' +
+	(enabled ? 'включён' : 'выключен') + '</span></div>');
+print('<div class="row"><span>Служба</span><span>' + esc(running_line ?? '?') + '</span></div>');
+if (has_link) {
+	print('<div class="row"><span>Сервер</span><span>' + esc(server) + ':' + esc(port) + '</span></div>');
+	print('<div class="row"><span>Транспорт</span><span>' + esc(network) + ' / ' + esc(security) + '</span></div>');
+	if (sni) print('<div class="row"><span>SNI</span><span>' + esc(sni) + '</span></div>');
+} else {
+	print('<div class="row"><span>Ссылка</span><span>не задана</span></div>');
+}
+if (routing_line) print('<div class="row"><span>Перехват</span><span>' + esc(routing_line) + '</span></div>');
+print('</div>');
+
+print('<div class="card">');
+print('<form method="post">');
+print('<button class="btn-on" name="action" value="on" type="submit">Включить</button>');
+print('<button class="btn-off" name="action" value="off" type="submit">Выключить</button>');
+print('</form>');
+print('</div>');
+
+print('<div class="card">');
+print('<form method="post">');
+print('<label>Новая ссылка сервера (vless://…)</label>');
+print('<input type="text" name="link" placeholder="vless://uuid@host:port?...">');
+print('<button class="btn-save" name="action" value="set-link" type="submit">Сохранить</button>');
+print('</form>');
+print('</div>');
+
+print('<div class="card">');
+print('<div class="row"><span>Домены в туннеле</span><span>' + domains_count + '</span></div>');
+print('<form method="post">');
+print('<label>Добавить домен</label>');
+print('<input type="text" name="domain" placeholder="example.com" autocapitalize="off" autocorrect="off">');
+print('<button class="btn-add" name="action" value="add-domain" type="submit">Добавить</button>');
+print('</form>');
+print('<details><summary>Показать/изменить весь список (' + domains_count + ')</summary>');
+print('<form method="post">');
+print('<textarea name="domains" spellcheck="false">' + esc(domains_raw) + '</textarea>');
+print('<p class="hint">Один домен на строке, # — комментарий. Удалить домен —');
+print('стереть его строку и сохранить.</p>');
+print('<button class="btn-save" name="action" value="save-domains" type="submit">Сохранить список</button>');
+print('</form>');
+print('</details>');
+print('</div>');
+
+if (action_result) {
+	print('<div class="card">');
+	print('<div class="row"><span>Результат</span><span>' +
+		(action_result.code == 0 ? '✓ успешно' : '✗ ошибка') + '</span></div>');
+	print('<pre>' + esc(redact(action_result.out)) + '</pre>');
+	print('</div>');
+}
+
+print('</body></html>');

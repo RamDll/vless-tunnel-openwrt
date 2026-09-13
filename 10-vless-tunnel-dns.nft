@@ -1,0 +1,112 @@
+# /etc/nftables.d/10-vless-tunnel.nft — вариант "-dns"
+#
+# Альтернатива основному (sniffing-based) варианту проекта: решение "туннель
+# или напрямую" принимает не Xray, а nftables — по членству резолвленного
+# IP в сете, который наполняет dnsmasq при резолве домена из списка
+# (директива nftset=). Внутри Xray один outbound, никакого routing/sniffing.
+#
+# Плюс: прямой трафик (не из списков) никогда не касается userspace —
+# полный offload ядра, включая аппаратный (PPE). Минус — та самая причина,
+# по которой в основном варианте проекта от этого подхода отказались:
+# устойчивость только к тому DNS, который реально проходит через роутер.
+# Клиент с DNS-over-HTTPS (например, часть браузеров по умолчанию)
+# обходит dnsmasq целиком — IP не попадает в сет, трафик уходит мимо
+# туннеля молча. См. HANDOFF.md, "Эволюция архитектуры", почему в основном
+# варианте от этого ушли. Держать оба варианта — осознанный выбор
+# владельца: один раз можно переключиться туда-обратно, если нужно
+# сравнить или тот вариант, что активен, внезапно не подходит.
+#
+# fw4 инклюдит этот файл ВНУТРЬ `table inet fw4` сам, поэтому здесь нет
+# объявления таблицы — только сеты и цепочки.
+
+# Статические подсети из /etc/vless-tunnel/subnets (v4-часть — строки без
+# ":"; v6-часть добавляется в vless6 ниже, sets_load() в vless-tunnel-dns.init
+# сам разбирает файл на обе части по формату записи).
+set vless4 {
+	type ipv4_addr
+	flags interval
+	auto-merge
+	comment "vless-tunnel: ручные подсети (IPv4)"
+}
+
+# Адреса, которые кладёт сюда dnsmasq при резолве A-записи домена из
+# списка. Интервалы тут запрещены (dnsmasq добавляет одиночные адреса),
+# зато нужен timeout — иначе сет растёт бесконечно; клиент при следующем
+# резолве добавит адрес заново.
+set vless4_dns {
+	type ipv4_addr
+	flags timeout
+	timeout 24h
+	comment "vless-tunnel: адреса из доменного списка (IPv4)"
+}
+
+set vless4_bypass {
+	type ipv4_addr
+	flags interval
+	auto-merge
+	comment "vless-tunnel: принудительно напрямую (IPv4)"
+}
+
+set vless6 {
+	type ipv6_addr
+	flags interval
+	auto-merge
+	comment "vless-tunnel: ручные подсети (IPv6)"
+}
+
+set vless6_dns {
+	type ipv6_addr
+	flags timeout
+	timeout 24h
+	comment "vless-tunnel: адреса из доменного списка (IPv6)"
+}
+
+set vless6_bypass {
+	type ipv6_addr
+	flags interval
+	auto-merge
+	comment "vless-tunnel: принудительно напрямую (IPv6)"
+}
+
+chain vless_prerouting {
+	type filter hook prerouting priority mangle; policy accept;
+
+	# Только трафик клиентов из LAN. Трафик самого роутера сюда не
+	# попадает (он идёт через output), поэтому петля невозможна
+	# и не нужно исключать Xray по uid.
+	iifname != "br-lan" return
+
+	# Служебное и локальное — всегда напрямую. Сюда же попадает
+	# обращение к самому роутеру: DNS на 53, LuCI, SSH.
+	ip daddr {
+		0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+		169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16,
+		224.0.0.0/4, 240.0.0.0/4
+	} return
+
+	ip daddr @vless4_bypass return
+
+	# Счётчики оставлены намеренно: по ним `vless-tunnel status`
+	# отличает «правил нет» от «правила есть, но трафик мимо».
+	meta l4proto { tcp, udp } ip daddr @vless4 \
+		counter meta mark set 0x1e5 tproxy ip to :12345 accept
+
+	meta l4proto { tcp, udp } ip daddr @vless4_dns \
+		counter meta mark set 0x1e5 tproxy ip to :12345 accept
+}
+
+chain vless_prerouting6 {
+	type filter hook prerouting priority mangle; policy accept;
+
+	iifname != "br-lan" return
+
+	ip6 daddr { ::1/128, fe80::/10, fc00::/7, ff00::/8 } return
+
+	ip6 daddr @vless6_bypass return
+
+	meta l4proto { tcp, udp } ip6 daddr @vless6 \
+		counter meta mark set 0x1e5 tproxy ip6 to :12345 accept
+
+	meta l4proto { tcp, udp } ip6 daddr @vless6_dns \
+		counter meta mark set 0x1e5 tproxy ip6 to :12345 accept
+}

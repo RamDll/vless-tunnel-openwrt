@@ -1,0 +1,926 @@
+#!/usr/bin/ucode
+// /usr/bin/vless-tunnel
+//
+// Разбор vless:// перенесён с Python (github.com/RamDll/vless-tunnel,
+// vless-tunnel.sh) на ucode. Архитектура: TPROXY в nftables перехватывает
+// ВЕСЬ TCP/UDP из LAN (кроме приватных сетей и ручного bypass), а решение
+// "домен из списка или нет" принимает сам Xray через sniffing SNI/TLS —
+// не через DNS. Список доменов (domains) и ручной IP-список (subnets)
+// вставляются прямо в routing.rules конфига как inline-списки, без
+// geosite.dat. См. HANDOFF.md, "Архитектурные решения", ревизия п.3.
+
+import * as fs from 'fs';
+import * as uci from 'uci';
+
+const APP = 'vless-tunnel';
+const UCI_CONF = 'vless-tunnel';
+const CONFIG_DIR = '/etc/vless-tunnel';
+const CONFIG_JSON = CONFIG_DIR + '/config.json';
+const DOMAINS_DEFAULT = CONFIG_DIR + '/domains';
+const SUBNETS_DEFAULT = CONFIG_DIR + '/subnets';
+const SELF_BIN = '/usr/bin/vless-tunnel';
+const INIT_SCRIPT = '/etc/init.d/vless-tunnel';
+const NFT_FILE = '/etc/nftables.d/10-vless-tunnel.nft';
+const XRAY_BIN = '/usr/bin/xray';
+const TEST_PORT = 18080;
+const TEST_TARGET = '1.1.1.1';
+
+const NETWORKS = ['tcp', 'raw', 'ws', 'grpc', 'http', 'h2', 'quic', 'kcp',
+                   'httpupgrade', 'xhttp', 'splithttp'];
+
+function fail(msg) {
+	die(msg);
+}
+
+// --- percent-decoding -------------------------------------------------
+// ucode не умеет декодировать URI из коробки (нет uri_decode). plus_space
+// включает декодирование '+' в пробел — так себя ведёт разбор query string
+// (application/x-www-form-urlencoded), но не userinfo/host/fragment.
+function hex_val(c) {
+	let o = ord(c);
+	if (o >= 48 && o <= 57) return o - 48;       // 0-9
+	if (o >= 97 && o <= 102) return o - 87;      // a-f
+	if (o >= 65 && o <= 70) return o - 55;       // A-F
+	return -1;
+}
+
+function pct_decode(s, plus_space) {
+	s = '' + (s ?? '');
+	let out = '';
+	let n = length(s);
+	for (let i = 0; i < n; i++) {
+		let c = substr(s, i, 1);
+		if (plus_space && c == '+') {
+			out += ' ';
+			continue;
+		}
+		if (c == '%' && i + 2 < n) {
+			let hi = hex_val(substr(s, i + 1, 1));
+			let lo = hex_val(substr(s, i + 2, 1));
+			if (hi >= 0 && lo >= 0) {
+				out += chr(hi * 16 + lo);
+				i += 2;
+				continue;
+			}
+		}
+		out += c;
+	}
+	return out;
+}
+
+function is_ipv4(s) {
+	return match(s, /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) != null &&
+		!length(filter(split(s, '.'), (p) => int(p) > 255));
+}
+
+function is_ipv6(s) {
+	// Достаточно грубой проверки: это не адрес назначения, а флаг для
+	// "резолвить сервер по домену или нет" (host_is_ip в build_config).
+	return index(s, ':') >= 0 && match(s, /^[0-9a-fA-F:]+$/) != null;
+}
+
+function is_ip(s) {
+	return is_ipv4(s) || is_ipv6(s);
+}
+
+function split_hostport(hp) {
+	hp = trim(hp ?? '');
+	let host, port;
+	if (substr(hp, 0, 1) == '[') {
+		let close = index(hp, ']');
+		if (close < 0) fail('некорректный IPv6-адрес в ссылке');
+		host = substr(hp, 1, close - 1);
+		let rest = substr(hp, close + 1);
+		port = substr(rest, 0, 1) == ':' ? substr(rest, 1) : '';
+	} else {
+		let first = index(hp, ':');
+		let last = rindex(hp, ':');
+		if (first < 0) {
+			host = hp;
+			port = '';
+		} else if (first != last) {
+			// два и больше ':' без скобок — это голый IPv6, порта нет
+			host = hp;
+			port = '';
+		} else {
+			host = substr(hp, 0, first);
+			port = substr(hp, first + 1);
+		}
+	}
+	return [pct_decode(trim(host)), trim(port)];
+}
+
+// --- разбор ссылки ------------------------------------------------------
+function parse_link(raw) {
+	raw = trim(trim(trim(raw ?? ''), '"'), "'");
+	let m = match(raw, /vless:\/\//i);
+	if (!m) fail('ожидается ссылка, начинающаяся с vless://');
+	let idx = index(lc(raw), 'vless://');
+	let link = replace(substr(raw, idx), /\s+/g, '');
+	if (!link || match(link, /^vless:\/\/\s*$/i))
+		fail('ссылка пустая');
+
+	let body = substr(link, length('vless://'));
+	let frag = '';
+	let hashPos = index(body, '#');
+	if (hashPos >= 0) {
+		frag = pct_decode(substr(body, hashPos + 1));
+		body = substr(body, 0, hashPos);
+	}
+	let qs = '';
+	let qPos = index(body, '?');
+	if (qPos >= 0) {
+		qs = substr(body, qPos + 1);
+		body = substr(body, 0, qPos);
+	}
+	let atPos = rindex(body, '@');
+	if (atPos < 0) fail('в ссылке нет части «UUID@хост:порт»');
+	let uuid = pct_decode(trim(substr(body, 0, atPos)));
+	let hp = split_hostport(substr(body, atPos + 1));
+	let host = hp[0];
+	let portStr = hp[1];
+	if (!uuid) fail('в ссылке не указан UUID');
+	if (!host) fail('в ссылке не указан адрес сервера');
+	let port = portStr ? int(portStr) : 443;
+	if (type(port) != 'int' || port < 1 || port > 65535)
+		fail('некорректный порт: ' + portStr);
+
+	let q = {};
+	if (qs) {
+		for (let pair in split(qs, '&')) {
+			if (!pair) continue;
+			let eq = index(pair, '=');
+			let k = lc(trim(pct_decode(eq >= 0 ? substr(pair, 0, eq) : pair, true)));
+			let v = eq >= 0 ? pct_decode(substr(pair, eq + 1), true) : '';
+			if (k) q[k] = v;
+		}
+	}
+
+	let net = lc(trim(q.type || q.network || 'tcp'));
+	if (net == 'h2' || net == 'http2') net = 'http';
+	if (net == '') net = 'tcp';
+	if (!(net in {tcp:1,raw:1,ws:1,grpc:1,http:1,quic:1,kcp:1,httpupgrade:1,xhttp:1,splithttp:1}))
+		fail('неизвестный транспорт type=' + net);
+
+	let security = lc(trim(q.security || 'none'));
+	if (security == '' || security == 'auto') security = 'none';
+	if (security == 'xtls') security = 'tls';
+	if (!(security in {none:1, tls:1, reality:1}))
+		fail('неизвестный security=' + security + ' (ожидается none, tls или reality)');
+
+	let alpn = [];
+	for (let a in split(q.alpn || '', /[,\s]+/))
+		if (a) push(alpn, a);
+
+	let p = {
+		link: link,
+		name: frag,
+		uuid: uuid,
+		host: host,
+		port: port,
+		host_is_ip: is_ip(host),
+		network: net,
+		security: security,
+		encryption: trim(q.encryption || '') || 'none',
+		flow: trim(q.flow || ''),
+		sni: trim(q.sni || ''),
+		alpn: alpn,
+		fp: trim(q.fp || ''),
+		pbk: trim(q.pbk || ''),
+		sid: trim(q.sid || ''),
+		spx: trim(q.spx || ''),
+		pqv: trim(q.pqv || ''),
+		path: trim(q.path || ''),
+		host_header: trim(q.host || ''),
+		service: trim(q.servicename || ''),
+		mode: lc(trim(q.mode || '')),
+		header_type: lc(trim(q.headertype || '')),
+		key: trim(q.key || ''),
+		seed: trim(q.seed || ''),
+		extra: trim(q.extra || ''),
+		allow_insecure: lc(trim(q.allowinsecure || '')) in {'1':1, 'true':1, 'yes':1, 'on':1},
+		ech: trim(q.ech || ''),
+	};
+
+	if (security == 'reality') {
+		if (!p.pbk) fail('в ссылке security=reality, но не указан publicKey (pbk)');
+		if (!(net in {tcp:1, raw:1, http:1, xhttp:1, splithttp:1, grpc:1}))
+			fail('REALITY не поддерживается с транспортом ' + net);
+	}
+	if (!(p.flow in {'':1, 'xtls-rprx-vision':1, 'xtls-rprx-vision-udp443':1}))
+		fail('неизвестный flow=' + p.flow);
+	if (p.flow && security == 'none')
+		fail('flow=' + p.flow + ' требует security=tls или security=reality');
+
+	return p;
+}
+
+// --- streamSettings -------------------------------------------------
+function build_stream(p) {
+	let net = p.network == 'raw' ? 'tcp' : p.network;
+	let st = { network: net };
+	let host_hdr = p.host_header || p.sni;
+
+	if (net == 'tcp') {
+		if (p.header_type == 'http') {
+			let req = { path: [p.path || '/'], headers: {} };
+			if (p.host_header) req.headers.Host = [p.host_header];
+			st.tcpSettings = { header: { type: 'http', request: req } };
+		}
+	} else if (net == 'ws') {
+		let s = {};
+		if (p.path) s.path = p.path;
+		if (host_hdr) s.host = host_hdr;
+		st.wsSettings = s;
+	} else if (net == 'grpc') {
+		let s = {};
+		if (p.service) s.serviceName = p.service;
+		if (p.mode == 'multi') s.multiMode = true;
+		st.grpcSettings = s;
+	} else if (net == 'http') {
+		let s = {};
+		if (host_hdr) s.host = filter(split(host_hdr, ','), (x) => x);
+		if (p.path) s.path = p.path;
+		st.httpSettings = s;
+	} else if (net == 'quic') {
+		st.quicSettings = {
+			security: 'none',
+			key: p.key,
+			header: { type: p.header_type || 'none' },
+		};
+	} else if (net == 'kcp') {
+		let s = {};
+		if (p.header_type && p.header_type != 'none') s.header = { type: p.header_type };
+		if (p.seed) s.seed = p.seed;
+		st.kcpSettings = s;
+	} else if (net == 'httpupgrade') {
+		let s = {};
+		if (p.path) s.path = p.path;
+		if (host_hdr) s.host = host_hdr;
+		st.httpupgradeSettings = s;
+	} else if (net == 'xhttp' || net == 'splithttp') {
+		let s = {};
+		if (p.path) s.path = p.path;
+		if (host_hdr) s.host = host_hdr;
+		if (p.mode) s.mode = p.mode;
+		if (p.extra) {
+			try {
+				let extra = json(p.extra);
+				if (type(extra) == 'object') s.extra = extra;
+			} catch (e) {
+				warn('предупреждение: параметр extra не разобран как JSON, пропущен\n');
+			}
+		}
+		st[net == 'xhttp' ? 'xhttpSettings' : 'splithttpSettings'] = s;
+	}
+
+	if (p.security == 'reality') {
+		let rs = {
+			serverName: p.sni || p.host_header || p.host,
+			fingerprint: p.fp || 'chrome',
+			publicKey: p.pbk,
+			shortId: p.sid,
+			spiderX: p.spx || '/',
+		};
+		if (p.pqv) rs.mldsa65Verify = p.pqv;
+		st.security = 'reality';
+		st.realitySettings = rs;
+	} else if (p.security == 'tls') {
+		let ts = { serverName: p.sni || p.host_header || p.host };
+		if (p.fp) ts.fingerprint = p.fp;
+		if (length(p.alpn)) ts.alpn = p.alpn;
+		if (p.allow_insecure) ts.allowInsecure = true;
+		if (p.ech) ts.echConfigList = p.ech;
+		st.security = 'tls';
+		st.tlsSettings = ts;
+	} else {
+		st.security = 'none';
+	}
+	return st;
+}
+
+// Xray с flow=xtls-rprx-vision сам отклоняет UDP/443 (QUIC). Суффикс
+// -udp443 — чисто клиентский флаг (сервер видит xtls-rprx-vision), без
+// него QUIC/HTTP-3 через туннель не работает.
+function effective_flow(p) {
+	if (p.flow == 'xtls-rprx-vision') return 'xtls-rprx-vision-udp443';
+	return p.flow;
+}
+
+// --- мелкие обёртки над fs / shell --------------------------------------
+function read_file(path) {
+	let f = fs.open(path, 'r');
+	if (!f) return null;
+	let data = f.read('all');
+	f.close();
+	return data;
+}
+
+function write_file(path, data) {
+	let f = fs.open(path, 'w');
+	if (!f) fail('не удалось открыть на запись: ' + path + ' (' + fs.error() + ')');
+	f.write(data);
+	f.close();
+}
+
+function ensure_dir(path) {
+	fs.access(path) || fs.mkdir(path);
+}
+
+// Шаблон списка создаём только если файла ещё нет — не затираем то, что
+// пользователь уже заполнил через predыдущий setup/set-link.
+function ensure_list_file(path, template) {
+	fs.access(path) || write_file(path, template);
+}
+
+// Список -> массив записей. Комментарии (#...) и пустые строки выкидываем.
+function read_list(path) {
+	let text = read_file(path);
+	if (!text) return [];
+	let out = [];
+	for (let line in split(text, '\n')) {
+		line = trim(replace(line, /#.*/, ''));
+		if (line) push(out, line);
+	}
+	return out;
+}
+
+// --- config.json ------------------------------------------------------
+// TPROXY в nftables перехватывает уже весь TCP/UDP из LAN (кроме
+// приватных сетей и bypass) — здесь, внутри Xray, решаем, что из этого
+// реально идёт в туннель. domains/subnets вставляются как inline-списки
+// в routing.rules, без geosite.dat: `domain:` — суффиксное совпадение
+// (поддомены автоматически), `ip` — точный/CIDR-адрес. Sniffing с
+// routeOnly:true берёт домен из TLS SNI/HTTP Host самого соединения —
+// не из DNS-ответа, поэтому не зависит от того, как клиент резолвил адрес
+// (в частности, устойчиво к DNS-over-HTTPS в обход роутера — см. HANDOFF).
+function build_config(p, o) {
+	let flow = effective_flow(p);
+	let user = { id: p.uuid, encryption: p.encryption || 'none' };
+	if (flow) user.flow = flow;
+
+	let proxy_out = {
+		tag: 'proxy',
+		protocol: 'vless',
+		settings: { vnext: [{ address: p.host, port: p.port, users: [user] }] },
+		streamSettings: build_stream(p),
+		mux: { enabled: false },
+	};
+	let direct_out = { tag: 'direct', protocol: 'freedom', settings: {} };
+
+	let domainRules = [];
+	for (let d in (o.domains || [])) push(domainRules, 'domain:' + d);
+	let ipRules = o.subnets || [];
+
+	let rules = [];
+	if (length(domainRules)) push(rules, { type: 'field', domain: domainRules, outboundTag: 'proxy' });
+	if (length(ipRules)) push(rules, { type: 'field', ip: ipRules, outboundTag: 'proxy' });
+	push(rules, { type: 'field', network: 'tcp,udp', outboundTag: 'direct' });
+
+	let sniffing = { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true };
+
+	return {
+		log: { loglevel: o.log_level || 'warning' },
+		inbounds: [{
+			tag: 'tproxy-in',
+			// TPROXY доставляет пакет "локально" по destination IP клиента,
+			// который почти никогда не равен 127.0.0.1 — сокет обязан
+			// слушать на 0.0.0.0, иначе ядро не находит слушателя.
+			listen: '0.0.0.0',
+			port: o.tproxy_port,
+			protocol: 'dokodemo-door',
+			settings: { network: 'tcp,udp', followRedirect: true },
+			streamSettings: { sockopt: { tproxy: 'tproxy' } },
+			// routeOnly: домен из sniffing участвует только в выборе
+			// outbound'а (routing.rules ниже), а реальное соединение (что
+			// в proxy, что в direct) идёт на исходный IP, который уже
+			// увидел TPROXY — без этого direct-путь потребовал бы своего
+			// DNS-резолва внутри Xray, которого мы сознательно избегаем.
+			sniffing: sniffing,
+		}, {
+			// Зеркало tproxy-in для IPv6 — тот же приём: слушать нужно на
+			// "::" (wildcard), не "::1", иначе TPROXY-доставка по чужому
+			// destination-адресу молча проваливается, ровно как с
+			// 0.0.0.0/127.0.0.1 у v4-инбаунда выше.
+			tag: 'tproxy-in6',
+			listen: '::',
+			port: o.tproxy_port,
+			protocol: 'dokodemo-door',
+			settings: { network: 'tcp,udp', followRedirect: true },
+			streamSettings: { sockopt: { tproxy: 'tproxy' } },
+			sniffing: sniffing,
+		}],
+		outbounds: [proxy_out, direct_out],
+		routing: { domainStrategy: 'AsIs', rules: rules },
+		policy: { levels: { '0': { bufferSize: 4 } } },
+	};
+}
+
+function summary(p) {
+	return sprintf(
+		'NETWORK=%s\nSECURITY=%s\nSERVER=%s\nSERVER_PORT=%d\nSERVER_IS_IP=%s\n' +
+		'NAME=%s\nSNI=%s\nFLOW=%s\nENCRYPTION=%s\nALLOW_INSECURE=%s\n',
+		p.network, p.security, p.host, p.port, p.host_is_ip ? 'true' : 'false',
+		replace(p.name, '\n', ' '), (p.sni || p.host_header), p.flow, p.encryption,
+		p.allow_insecure ? 'true' : 'false'
+	);
+}
+
+// Выполняет команду, отдаёт { code, output } — вывод и stderr вместе.
+function run_capture(cmd) {
+	let p = fs.popen(cmd + ' 2>&1', 'r');
+	if (!p) return { code: -1, output: '' };
+	let out = p.read('all') || '';
+	let code = p.close();
+	return { code: code, output: out };
+}
+
+// Запускает команду в фоне, не дожидаясь завершения, возвращает PID.
+// stdin/stdout/stderr фонового процесса обязаны быть переопределены —
+// иначе он может умереть вместе с закрытием нашего popen-канала.
+function run_background(cmd, log) {
+	let p = fs.popen("sh -c '" + cmd + " </dev/null >" + log + " 2>&1 & echo $!'", 'r');
+	let pid = trim(p.read('all') ?? '');
+	p.close();
+	return pid;
+}
+
+function port_listening(port) {
+	let hex = uc(sprintf('%04x', port));
+	for (let path in ['/proc/net/tcp', '/proc/net/tcp6']) {
+		let data = read_file(path);
+		if (!data) continue;
+		for (let line in split(data, '\n')) {
+			let cols = split(trim(replace(line, /[ \t]+/g, ' ')), ' ');
+			if (length(cols) < 4) continue;
+			let addr = split(cols[1], ':');
+			if (length(addr) == 2 && uc(addr[1]) == hex && cols[3] == '0A')
+				return true;
+		}
+	}
+	return false;
+}
+
+// --- UCI: /etc/config/vless-tunnel --------------------------------------
+function cfg_defaults() {
+	return {
+		enabled: '0', link: '', lan: 'br-lan', tproxy_port: '12345',
+		fwmark: '0x1e5', table: '100',
+		domains: DOMAINS_DEFAULT, subnets: SUBNETS_DEFAULT, ipv6: 'block',
+	};
+}
+
+function cfg_get_all() {
+	let d = cfg_defaults();
+	try {
+		let c = uci.cursor();
+		let cur = c.get_all(UCI_CONF, 'main');
+		if (cur) for (let k in d) if (cur[k] != null) d[k] = cur[k];
+	} catch (e) { }
+	return d;
+}
+
+// Создаёт секцию 'main' с дефолтами, если её ещё нет — идемпотентно,
+// безопасно звать из любой команды, которой нужен конфиг.
+function cfg_ensure() {
+	fs.access('/etc/config/' + UCI_CONF) || write_file('/etc/config/' + UCI_CONF, '');
+	let c = uci.cursor();
+	if (!c.get_all(UCI_CONF, 'main')) {
+		c.set(UCI_CONF, 'main', 'tunnel');
+		let d = cfg_defaults();
+		for (let k in d) c.set(UCI_CONF, 'main', k, d[k]);
+		c.commit(UCI_CONF);
+	}
+	return c;
+}
+
+function cfg_set(kv) {
+	let c = cfg_ensure();
+	for (let k in kv) c.set(UCI_CONF, 'main', k, kv[k]);
+	c.commit(UCI_CONF);
+}
+
+// Читает domains/subnets заново при каждом вызове — правки в этих файлах
+// применяются к routing.rules сразу при следующей пересборке config.json
+// (set-link, on, либо явный _build-config), без отдельной "перезагрузки
+// списков" как раньше у dnsmasq.
+function default_opts() {
+	let cfg = cfg_get_all();
+	return {
+		tproxy_port: int(cfg.tproxy_port),
+		log_level: 'warning',
+		domains: read_list(cfg.domains),
+		subnets: read_list(cfg.subnets),
+	};
+}
+
+function service_running() {
+	return system(INIT_SCRIPT + ' status >/dev/null 2>&1') == 0;
+}
+
+// --- тестовый (нетуннельный) конфиг для `test` --------------------------
+// dokodemo-door с фиксированным адресом вместо tproxy: любое TCP-соединение
+// на TEST_PORT прозрачно форвардится на TEST_TARGET:80 через настоящий
+// outbound. Не нужен ни nftables, ни перехват LAN-трафика — только сама
+// связь с сервером. Сознательно не HTTP-proxy inbound: локальный
+// uclient-fetch (wget) на OpenWrt через http_proxy для доменных целей
+// падает с "Operation not permitted" и путает относительные редиректы —
+// с фиксированным форвардом wget просто стучится в 127.0.0.1 напрямую.
+function build_test_config(p) {
+	let flow = effective_flow(p);
+	let user = { id: p.uuid, encryption: p.encryption || 'none' };
+	if (flow) user.flow = flow;
+	return {
+		log: { loglevel: 'warning' },
+		inbounds: [{
+			tag: 'test-in', listen: '127.0.0.1', port: TEST_PORT,
+			protocol: 'dokodemo-door',
+			settings: { address: TEST_TARGET, port: 80, network: 'tcp' },
+		}],
+		outbounds: [{
+			tag: 'proxy', protocol: 'vless',
+			settings: { vnext: [{ address: p.host, port: p.port, users: [user] }] },
+			streamSettings: build_stream(p),
+			mux: { enabled: false },
+		}],
+	};
+}
+
+// --- команды -------------------------------------------------------------
+function cmd_parse(link) {
+	print(summary(parse_link(link)));
+}
+
+function cmd_make(link, out_path) {
+	let p = parse_link(link);
+	let cfg = build_config(p, default_opts());
+	write_file(out_path, sprintf('%.J\n', cfg));
+	print(summary(p));
+}
+
+// Проверяет ссылку, валидирует итоговый config.json ядром Xray и только
+// после этого перезаписывает боевой конфиг и сохраняет ссылку в UCI —
+// битая ссылка не должна ломать уже работающий туннель.
+//
+// Объявлена раньше cmd_setup(), которая её вызывает: ucode не хойстит
+// функции, как JS, — на момент вызова функция уже должна быть объявлена
+// выше по файлу.
+function cmd_set_link(link) {
+	let p = parse_link(link);
+	let cfg = build_config(p, default_opts());
+	let tmp = '/tmp/vless-tunnel-check.json';
+	write_file(tmp, sprintf('%.J\n', cfg));
+
+	if (fs.access(XRAY_BIN)) {
+		let r = run_capture(XRAY_BIN + ' run -test -c ' + tmp);
+		fs.unlink(tmp);
+		if (r.code != 0) fail('Xray отверг конфигурацию:\n' + r.output);
+	} else {
+		fs.unlink(tmp);
+		warn('предупреждение: ' + XRAY_BIN + ' не найден, конфигурация не проверена ядром\n');
+	}
+
+	ensure_dir(CONFIG_DIR);
+	write_file(CONFIG_JSON, sprintf('%.J\n', cfg));
+	cfg_set({ link: p.link });
+	print(summary(p));
+
+	if (service_running()) {
+		print('\nслужба запущена — перезапускаю с новой конфигурацией\n');
+		let r = run_capture(INIT_SCRIPT + ' restart');
+		if (r.output) print(r.output);
+	} else {
+		print('\nконфигурация сохранена. включить: vless-tunnel on\n');
+	}
+}
+
+// Внутренняя команда: пересобирает config.json из уже сохранённой в UCI
+// ссылки и текущих domains/subnets. Init-скрипт зовёт её при каждом
+// старте службы — так правки в domains/subnets применяются на следующий
+// `on`/`restart` без повторного set-link (раньше для этого хватало
+// перечитать список в dns_up(), теперь список нужен ещё на этапе сборки
+// самого config.json).
+function cmd_build_config() {
+	let cfg = cfg_get_all();
+	if (!cfg.link) fail('ссылка не задана — vless-tunnel set-link "vless://..."');
+	let p = parse_link(cfg.link);
+	ensure_dir(CONFIG_DIR);
+	write_file(CONFIG_JSON, sprintf('%.J\n', build_config(p, default_opts())));
+}
+
+function cmd_setup(link) {
+	ensure_dir(CONFIG_DIR);
+	cfg_ensure();
+	ensure_list_file(DOMAINS_DEFAULT,
+		"# vless-tunnel: домены для туннеля, один на строке, # — комментарий\n" +
+		"# поддомены попадают автоматически\n# youtube.com\n");
+	ensure_list_file(SUBNETS_DEFAULT,
+		"# vless-tunnel: подсети для туннеля, один CIDR на строке\n# 203.0.113.0/24\n");
+	print('vless-tunnel: рабочие файлы готовы (' + CONFIG_DIR + ').\n');
+	if (link) {
+		cmd_set_link(link);
+	} else {
+		print('дальше: vless-tunnel set-link "vless://..."\n');
+	}
+}
+
+function cmd_on() {
+	if (!fs.access(CONFIG_JSON))
+		fail('нет конфигурации — сначала vless-tunnel set-link "vless://..."');
+	cfg_set({ enabled: '1' });
+	let r = run_capture(INIT_SCRIPT + ' start');
+	if (r.output) print(r.output);
+	if (r.code != 0) fail('служба не запустилась (код ' + r.code + ')');
+	print('vless-tunnel включён.\n');
+}
+
+function cmd_off() {
+	cfg_set({ enabled: '0' });
+	let r = run_capture(INIT_SCRIPT + ' stop');
+	if (r.output) print(r.output);
+	print('vless-tunnel выключен.\n');
+}
+
+function cmd_status() {
+	let cfg = cfg_get_all();
+	print('enabled: ' + (cfg.enabled == '1' ? 'да' : 'нет') + '\n');
+
+	if (cfg.link) {
+		try {
+			print(summary(parse_link(cfg.link)));
+		} catch (e) {
+			print('ссылка сохранена, но не разбирается: ' + e.message + '\n');
+		}
+	} else {
+		print('ссылка не задана\n');
+	}
+
+	print('служба: ' + (service_running() ? 'работает' : 'остановлена') + '\n');
+
+	let rule = run_capture('ip rule list');
+	let routed = index(rule.output, 'fwmark ' + cfg.fwmark) >= 0;
+	print('policy routing (' + cfg.fwmark + '/' + cfg.table + '): ' +
+		(routed ? 'активен' : 'не активен') + '\n');
+
+	let chain = run_capture('nft list chain inet fw4 vless_prerouting');
+	if (chain.code != 0) {
+		print('перехват: правила fw4 не загружены (' + NFT_FILE + ')\n');
+	} else {
+		print('перехват (счётчики):\n');
+		for (let line in split(chain.output, '\n'))
+			if (index(line, 'counter') >= 0) print('  ' + trim(line) + '\n');
+	}
+
+	let o = default_opts();
+	print('в туннель по домену: ' + length(o.domains) + ', по IP: ' + length(o.subnets) + '\n');
+}
+
+// Проверка связи с сервером в обход nftables/TPROXY: временный http-
+// inbound на TEST_PORT, реальный proxy-outbound из сохранённой ссылки.
+function cmd_test() {
+	let cfg = cfg_get_all();
+	if (!cfg.link) fail('ссылка не задана — vless-tunnel set-link "vless://..."');
+	let p = parse_link(cfg.link);
+
+	let tmp = '/tmp/vless-tunnel-test.json';
+	let log = '/tmp/vless-tunnel-test.log';
+	write_file(tmp, sprintf('%.J\n', build_test_config(p)));
+
+	let check = run_capture(XRAY_BIN + ' run -test -c ' + tmp);
+	if (check.code != 0) {
+		fs.unlink(tmp);
+		fail('Xray отверг тестовую конфигурацию:\n' + check.output);
+	}
+
+	let pid = run_background(XRAY_BIN + ' run -c ' + tmp, log);
+	let ready = false;
+	for (let i = 0; i < 10; i++) {
+		if (port_listening(TEST_PORT)) { ready = true; break; }
+		system('sleep 1');
+	}
+
+	if (!ready) {
+		system('kill ' + pid + ' 2>/dev/null');
+		fs.unlink(tmp);
+		fail('Xray не поднял тестовый порт за 10с, см. ' + log);
+	}
+
+	let r = run_capture('wget -T 8 -O- http://127.0.0.1:' + TEST_PORT + '/');
+	system('kill ' + pid + ' 2>/dev/null');
+	fs.unlink(tmp);
+
+	if (r.code != 0) fail('сервер недоступен через туннель:\n' + r.output);
+	print('OK: ' + p.host + ':' + p.port + ' (' + p.network + '/' + p.security +
+		') отвечает через туннель\n');
+}
+
+function check(label, ok, detail) {
+	print((ok ? '[OK]   ' : '[FAIL] ') + label + (detail ? ' — ' + detail : '') + '\n');
+	return ok;
+}
+
+function cmd_doctor() {
+	let ok = true;
+
+	ok = check('xray-core установлен (' + XRAY_BIN + ')', !!fs.access(XRAY_BIN)) && ok;
+
+	let chain = run_capture('nft list chain inet fw4 vless_prerouting');
+	ok = check('nft-правила загружены в fw4', chain.code == 0,
+		chain.code == 0 ? null : 'проверьте ' + NFT_FILE + ' и fw4 check') && ok;
+
+	let cfg = cfg_get_all();
+	ok = check('ссылка сервера задана', cfg.link != '') && ok;
+	if (cfg.link) {
+		try {
+			parse_link(cfg.link);
+			check('ссылка разбирается корректно', true);
+		} catch (e) {
+			check('ссылка разбирается корректно', false, e.message);
+			ok = false;
+		}
+	}
+
+	let o = default_opts();
+	check('доменов в списке: ' + length(o.domains) + ', IP-подсетей: ' + length(o.subnets), true);
+
+	if (fs.access(CONFIG_JSON) && fs.access(XRAY_BIN)) {
+		let r = run_capture(XRAY_BIN + ' run -test -c ' + CONFIG_JSON);
+		ok = check('текущий config.json проходит проверку ядром', r.code == 0,
+			r.code == 0 ? null : r.output) && ok;
+	}
+
+	print(ok ? '\nвсё в порядке.\n' : '\nесть проблемы, см. выше.\n');
+	if (!ok) exit(1);
+}
+
+// --- управление списком доменов -----------------------------------------
+// Отдельно от setup/set-link: домены меняются заметно чаще, чем ссылка
+// сервера, и не должны требовать пересборки/проверки всего конфига с нуля
+// каждый раз через CLI-аргумент — отсюда точечные add/remove поверх уже
+// существующего файла, плюс bulk-замена для веб-страницы (правит весь файл
+// сразу, включая комментарии-заголовки категорий).
+
+function domains_path() {
+	return cfg_get_all().domains;
+}
+
+// Не полноценная RFC-валидация домена — только защита от явного мусора
+// (пустая строка, пробелы, случайно вставленный комментарий).
+function is_valid_domain_line(d) {
+	return d != '' && index(d, '#') < 0 && !match(d, / /) && index(d, '.') > 0;
+}
+
+// Пересобирает config.json из актуальных domains/subnets и перезапускает
+// службу, если она уже работает — тот же принцип, что у set-link: правки
+// применяются сразу, а не только на следующий ручной restart.
+function apply_lists_change() {
+	if (!fs.access(CONFIG_JSON)) return;
+	let r = run_capture(SELF_BIN + ' _build-config');
+	if (r.code != 0) { warn('ошибка пересборки config.json:\n' + r.output + '\n'); return; }
+	if (service_running()) run_capture(INIT_SCRIPT + ' restart');
+}
+
+function cmd_domains() {
+	for (let d in read_list(domains_path())) print(d + '\n');
+}
+
+function cmd_add_domain(d) {
+	d = lc(trim(d ?? ''));
+	if (!is_valid_domain_line(d)) fail('некорректный домен: ' + d);
+	let path = domains_path();
+	ensure_dir(CONFIG_DIR);
+	ensure_list_file(path, '');
+	for (let e in read_list(path))
+		if (e == d) { print('уже в списке: ' + d + '\n'); return; }
+	let f = fs.open(path, 'a');
+	if (!f) fail('не удалось открыть на запись: ' + path);
+	f.write(d + '\n');
+	f.close();
+	print('добавлено: ' + d + '\n');
+	apply_lists_change();
+}
+
+// Удаляет только строку с самим доменом (после отсечения комментария) —
+// остальные строки файла, включая заголовки категорий и пустые строки,
+// остаются как есть.
+function cmd_remove_domain(d) {
+	d = lc(trim(d ?? ''));
+	let path = domains_path();
+	let text = read_file(path) ?? '';
+	let kept = [];
+	let found = false;
+	for (let line in split(text, '\n')) {
+		let bare = lc(trim(replace(line, /#.*/, '')));
+		if (bare == d) { found = true; continue; }
+		push(kept, line);
+	}
+	if (!found) fail('не найдено в списке: ' + d);
+	write_file(path, join('\n', kept));
+	print('удалено: ' + d + '\n');
+	apply_lists_change();
+}
+
+// Внутренняя: замена всего файла целиком (для веб-страницы — там
+// редактируется общий textarea, а не одна запись).
+function cmd_set_domains_file(tmp_path) {
+	let text = read_file(tmp_path);
+	if (text == null) fail('не удалось прочитать ' + tmp_path);
+	ensure_dir(CONFIG_DIR);
+	write_file(domains_path(), text);
+	apply_lists_change();
+}
+
+// Снимает только то, что сами же добавили в живой ruleset — целенаправленно
+// через nft delete, а не через fw4 reload: на роутере рядом вполне может
+// стоять другой сервис со своими nft-правилами мимо /etc/nftables.d
+// (см. HANDOFF.md), и полный reload их бы снёс.
+function cmd_uninstall() {
+	if (fs.access(INIT_SCRIPT)) {
+		run_capture(INIT_SCRIPT + ' stop');
+		run_capture(INIT_SCRIPT + ' disable');
+	}
+	for (let name in ['vless_prerouting', 'vless_prerouting6', 'vless_forward6'])
+		system('nft delete chain inet fw4 ' + name + ' 2>/dev/null');
+	for (let name in ['vless4_bypass', 'vless6_bypass'])
+		system('nft delete set inet fw4 ' + name + ' 2>/dev/null');
+
+	fs.unlink(NFT_FILE);
+
+	system('rm -rf ' + CONFIG_DIR);
+	system('uci -q delete ' + UCI_CONF + '.main; uci commit ' + UCI_CONF);
+	fs.unlink('/etc/config/' + UCI_CONF);
+	fs.unlink(INIT_SCRIPT);
+	fs.unlink('/www/cgi-bin/vless-tunnel');
+	fs.unlink('/www/t.html');
+
+	print('vless-tunnel удалён.\n');
+	print('Пакет xray-core и сам ' + '/usr/bin/vless-tunnel' +
+		' не тронуты — уберите вручную при необходимости.\n');
+}
+
+function usage() {
+	warn('использование: vless-tunnel <команда> [аргументы]\n\n' +
+		'  setup [ссылка]        подготовить рабочие файлы, опционально задать ссылку\n' +
+		'  set-link <ссылка>     разобрать ссылку, проверить и сохранить конфигурацию\n' +
+		'  on / off              включить / выключить туннель\n' +
+		'  status                текущее состояние\n' +
+		'  test                  проверить связь с сервером в обход nftables\n' +
+		'  doctor                диагностика окружения\n' +
+		'  domains               вывести текущий список доменов\n' +
+		'  add-domain <домен>    добавить домен в список\n' +
+		'  remove-domain <домен> убрать домен из списка\n' +
+		'  uninstall             удалить конфигурацию и правила\n' +
+		'  parse <ссылка>        разобрать ссылку и напечатать разбор (отладка)\n' +
+		'  make <ссылка> <файл>  собрать config.json в указанный файл (отладка)\n');
+	exit(2);
+}
+
+let args = ARGV;
+if (!length(args)) usage();
+let cmd = args[0];
+
+try {
+	if (cmd == 'parse') {
+		if (length(args) < 2) usage();
+		cmd_parse(args[1]);
+	} else if (cmd == 'make') {
+		if (length(args) < 3) usage();
+		cmd_make(args[1], args[2]);
+	} else if (cmd == 'setup') {
+		cmd_setup(args[1]);
+	} else if (cmd == 'set-link') {
+		if (length(args) < 2) usage();
+		cmd_set_link(args[1]);
+	} else if (cmd == 'on') {
+		cmd_on();
+	} else if (cmd == 'off') {
+		cmd_off();
+	} else if (cmd == 'status') {
+		cmd_status();
+	} else if (cmd == 'test') {
+		cmd_test();
+	} else if (cmd == 'doctor') {
+		cmd_doctor();
+	} else if (cmd == 'uninstall') {
+		cmd_uninstall();
+	} else if (cmd == '_build-config') {
+		cmd_build_config();
+	} else if (cmd == 'domains') {
+		cmd_domains();
+	} else if (cmd == 'add-domain') {
+		if (length(args) < 2) usage();
+		cmd_add_domain(args[1]);
+	} else if (cmd == 'remove-domain') {
+		if (length(args) < 2) usage();
+		cmd_remove_domain(args[1]);
+	} else if (cmd == '_set-domains-file') {
+		if (length(args) < 2) usage();
+		cmd_set_domains_file(args[1]);
+	} else {
+		warn('неизвестная команда: ' + cmd + '\n');
+		usage();
+	}
+} catch (e) {
+	warn('ошибка: ' + e.message + '\n');
+	exit(1);
+}
