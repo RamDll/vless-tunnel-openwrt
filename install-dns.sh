@@ -222,9 +222,14 @@ elif apk add https-dns-proxy >/tmp/vless-tunnel-doh-install.log 2>&1; then
 	uci -q del_list dhcp.@dnsmasq[0].doh_server='127.0.0.1#5054' || true
 	uci -q del_list dhcp.@dnsmasq[0].doh_backup_server='127.0.0.1#5054' || true
 	uci commit dhcp
-	/etc/init.d/https-dns-proxy enable
-	/etc/init.d/https-dns-proxy restart
-	/etc/init.d/dnsmasq restart
+	# apk add у https-dns-proxy сам стартует службу через post-install —
+	# следующие restart иногда ловят гонку за procd-локом с этим уже
+	# идущим стартом и возвращают ошибку (не зависают, но нефатально:
+	# конфиг уже применён выше, а служба и так поднята постинстом). Не
+	# валим весь install ради этого — DoH в любом случае уже настроен.
+	/etc/init.d/https-dns-proxy enable || true
+	/etc/init.d/https-dns-proxy restart || log "предупреждение: https-dns-proxy restart вернул ошибку (гонка с post-install), служба и так должна быть поднята"
+	/etc/init.d/dnsmasq restart || log "предупреждение: dnsmasq restart вернул ошибку, перезапустите вручную при необходимости"
 else
 	log "предупреждение: https-dns-proxy не встал (см. /tmp/vless-tunnel-doh-install.log," \
 		"возможно конфликт с forkop) — DNS роутера остаётся как есть, можно настроить позже вручную"
