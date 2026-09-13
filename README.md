@@ -18,6 +18,12 @@ Xray (нужны XHTTP и VLESS Encryption `mlkem768x25519plus`).
 DNS-over-HTTPS на клиенте.
 
 ```sh
+wget -qO /tmp/install.sh https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main/install.sh && VLESS_TUNNEL_BASE_URL=https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main sh /tmp/install.sh
+```
+
+Или сразу со ссылкой сервера — вторым аргументом:
+
+```sh
 wget -qO /tmp/install.sh https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main/install.sh && VLESS_TUNNEL_BASE_URL=https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main sh /tmp/install.sh "vless://..."
 ```
 
@@ -26,13 +32,18 @@ wget -qO /tmp/install.sh https://raw.githubusercontent.com/RamDll/vless-tunnel-o
 (полный offload), но уязвим к DoH на клиенте.
 
 ```sh
+wget -qO /tmp/install-dns.sh https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main/install-dns.sh && VLESS_TUNNEL_BASE_URL=https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main sh /tmp/install-dns.sh
+```
+
+Или сразу со ссылкой сервера:
+
+```sh
 wget -qO /tmp/install-dns.sh https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main/install-dns.sh && VLESS_TUNNEL_BASE_URL=https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main sh /tmp/install-dns.sh "vless://..."
 ```
 
-Ссылку `vless://...` можно не указывать и задать потом через
-`vless-tunnel set-link "vless://..."`. Оба скрипта сами скачивают
-остальные файлы и сверяют `sha256sums`, ставят `xray-core` и (по
-возможности) `https-dns-proxy` для DoH-резолва самого роутера.
+Оба скрипта сами скачивают остальные файлы и сверяют `sha256sums`,
+ставят `xray-core` и (по возможности) `https-dns-proxy` для DoH-резолва
+самого роутера.
 
 ## Использование
 
