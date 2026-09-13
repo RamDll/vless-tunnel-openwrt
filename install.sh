@@ -221,12 +221,12 @@ if apk info -e https-dns-proxy >/dev/null 2>&1; then
 	log "https-dns-proxy уже установлен — не трогаю"
 elif apk add https-dns-proxy >/tmp/vless-tunnel-doh-install.log 2>&1; then
 	log "https-dns-proxy установлен — настраиваю (Cloudflare, без force_dns)"
-	uci -q delete https-dns-proxy.@https-dns-proxy[1]
+	uci -q delete https-dns-proxy.@https-dns-proxy[1] || true
 	uci set https-dns-proxy.config.force_dns='0'
 	uci commit https-dns-proxy
-	uci -q del_list dhcp.@dnsmasq[0].server='127.0.0.1#5054'
-	uci -q del_list dhcp.@dnsmasq[0].doh_server='127.0.0.1#5054'
-	uci -q del_list dhcp.@dnsmasq[0].doh_backup_server='127.0.0.1#5054'
+	uci -q del_list dhcp.@dnsmasq[0].server='127.0.0.1#5054' || true
+	uci -q del_list dhcp.@dnsmasq[0].doh_server='127.0.0.1#5054' || true
+	uci -q del_list dhcp.@dnsmasq[0].doh_backup_server='127.0.0.1#5054' || true
 	uci commit dhcp
 	/etc/init.d/https-dns-proxy enable
 	/etc/init.d/https-dns-proxy restart
