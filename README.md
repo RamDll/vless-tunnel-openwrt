@@ -18,9 +18,7 @@ Xray (нужны XHTTP и VLESS Encryption `mlkem768x25519plus`).
 DNS-over-HTTPS на клиенте.
 
 ```sh
-wget -qO /tmp/install.sh https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main/install.sh
-VLESS_TUNNEL_BASE_URL=https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main \
-  sh /tmp/install.sh "vless://..."
+wget -qO /tmp/install.sh https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main/install.sh && VLESS_TUNNEL_BASE_URL=https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main sh /tmp/install.sh "vless://..."
 ```
 
 **Вариант B — DNS (`-dns`).** Решение принимает nftables по членству IP
@@ -28,9 +26,7 @@ VLESS_TUNNEL_BASE_URL=https://raw.githubusercontent.com/RamDll/vless-tunnel-open
 (полный offload), но уязвим к DoH на клиенте.
 
 ```sh
-wget -qO /tmp/install-dns.sh https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main/install-dns.sh
-VLESS_TUNNEL_BASE_URL=https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main \
-  sh /tmp/install-dns.sh "vless://..."
+wget -qO /tmp/install-dns.sh https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main/install-dns.sh && VLESS_TUNNEL_BASE_URL=https://raw.githubusercontent.com/RamDll/vless-tunnel-openwrt/main sh /tmp/install-dns.sh "vless://..."
 ```
 
 Ссылку `vless://...` можно не указывать и задать потом через
@@ -49,6 +45,6 @@ vless-tunnel add-domain <d>  # добавить домен в список
 vless-tunnel remove-domain <d>
 ```
 
-Веб-интерфейс: `http://<роутер>/t.html` (без пароля, только LAN).
+Веб-интерфейс: `http://192.168.1.1/t.html` (без пароля, только LAN; замените на IP своего роутера, если он другой).
 
 Подробности архитектуры, найденные баги и решения — в [HANDOFF.md](HANDOFF.md).
