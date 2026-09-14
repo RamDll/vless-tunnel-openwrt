@@ -47,6 +47,21 @@ function hex_val(c) {
 	return -1;
 }
 
+// ucode int() не парсит "0x..."-строки (возвращает 0) — нужен свой разбор
+// для сверки fwmark из UCI (строка вида "0x1e5") с тем, что реально
+// напечатает `nft list` (нормализованный "0x000001e5").
+function hex_to_int(s) {
+	s = lc(trim(s ?? ''));
+	if (index(s, '0x') == 0) s = substr(s, 2);
+	let n = 0;
+	for (let i = 0; i < length(s); i++) {
+		let v = hex_val(substr(s, i, 1));
+		if (v < 0) return null;
+		n = n * 16 + v;
+	}
+	return n;
+}
+
 function pct_decode(s, plus_space) {
 	s = '' + (s ?? '');
 	let out = '';
@@ -326,6 +341,13 @@ function write_file(path, data) {
 	f.close();
 }
 
+// config.json содержит UUID/ключи ссылки сервера — не должен быть
+// читаем кем попало на многопользовательской системе.
+function write_config_json(data) {
+	write_file(CONFIG_JSON, data);
+	fs.chmod(CONFIG_JSON, 0600);
+}
+
 function ensure_dir(path) {
 	fs.access(path) || fs.mkdir(path);
 }
@@ -559,7 +581,7 @@ function cmd_set_link(link) {
 	}
 
 	ensure_dir(CONFIG_DIR);
-	write_file(CONFIG_JSON, sprintf('%.J\n', cfg));
+	write_config_json(sprintf('%.J\n', cfg));
 	cfg_set({ link: p.link });
 	print(summary(p));
 
@@ -578,12 +600,30 @@ function cmd_set_link(link) {
 // `on`/`restart` без повторного set-link (раньше для этого хватало
 // перечитать список в dns_up(), теперь список нужен ещё на этапе сборки
 // самого config.json).
+//
+// Та же защита, что в cmd_set_link: сначала во временный файл, проверка
+// ядром, и только потом поверх боевого config.json — битый список
+// доменов (например, после кривой правки через textarea в веб-GUI) не
+// должен убивать уже работавшую конфигурацию так, что служба не
+// поднимется после рестарта.
 function cmd_build_config() {
 	let cfg = cfg_get_all();
 	if (!cfg.link) fail('ссылка не задана — vless-tunnel set-link "vless://..."');
 	let p = parse_link(cfg.link);
+	let built = sprintf('%.J\n', build_config(p, default_opts()));
+	let tmp = '/tmp/vless-tunnel-check.json';
+	write_file(tmp, built);
+
+	if (fs.access(XRAY_BIN)) {
+		let r = run_capture(XRAY_BIN + ' run -test -c ' + tmp);
+		fs.unlink(tmp);
+		if (r.code != 0) fail('Xray отверг пересобранную конфигурацию (проверьте domains/subnets):\n' + r.output);
+	} else {
+		fs.unlink(tmp);
+	}
+
 	ensure_dir(CONFIG_DIR);
-	write_file(CONFIG_JSON, sprintf('%.J\n', build_config(p, default_opts())));
+	write_config_json(built);
 }
 
 function cmd_setup(link) {
@@ -717,7 +757,25 @@ function cmd_doctor() {
 	ok = check('nft-правила загружены в fw4', chain.code == 0,
 		chain.code == 0 ? null : 'проверьте ' + NFT_FILE + ' и fw4 check') && ok;
 
+	let mod = run_capture('grep -q nft_tproxy /proc/modules');
+	ok = check('модуль ядра nft_tproxy загружен', mod.code == 0,
+		mod.code == 0 ? null : 'apk add kmod-nft-tproxy kmod-nf-tproxy') && ok;
+
 	let cfg = cfg_get_all();
+
+	// nft-файл подставляется из UCI один раз, при установке (см. install*.sh)
+	// — если fwmark/tproxy_port поменяли в UCI без переустановки, здесь это
+	// разойдётся молча, кроме как в этой проверке.
+	if (chain.code == 0) {
+		let mark_m = match(chain.output, /mark set (0x[0-9a-fA-F]+)/);
+		let port_m = match(chain.output, /tproxy ip6? to :([0-9]+)/);
+		let synced = mark_m && port_m &&
+			hex_to_int(mark_m[1]) == hex_to_int(cfg.fwmark) &&
+			int(port_m[1]) == int(cfg.tproxy_port);
+		ok = check('nft-правила совпадают с fwmark/tproxy_port из UCI', synced,
+			synced ? null : 'значения разошлись — переустановите (sh install*.sh), nft-файл соберётся заново из UCI') && ok;
+	}
+
 	ok = check('ссылка сервера задана', cfg.link != '') && ok;
 	if (cfg.link) {
 		try {
@@ -736,6 +794,12 @@ function cmd_doctor() {
 		let r = run_capture(XRAY_BIN + ' run -test -c ' + CONFIG_JSON);
 		ok = check('текущий config.json проходит проверку ядром', r.code == 0,
 			r.code == 0 ? null : r.output) && ok;
+	}
+
+	if (service_running()) {
+		let listening = run_capture('netstat -ln 2>/dev/null | grep -q ":' + cfg.tproxy_port + ' "');
+		ok = check('служба работает — Xray слушает tproxy_port ' + cfg.tproxy_port, listening.code == 0,
+			listening.code == 0 ? null : 'порт не занят — Xray мог не подняться, см. logread') && ok;
 	}
 
 	print(ok ? '\nвсё в порядке.\n' : '\nесть проблемы, см. выше.\n');

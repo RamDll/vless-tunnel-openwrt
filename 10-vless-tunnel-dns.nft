@@ -94,11 +94,20 @@ chain vless_prerouting {
 
 	# Счётчики оставлены намеренно: по ним `vless-tunnel status`
 	# отличает «правил нет» от «правила есть, но трафик мимо».
+	#
+	# Порядок важен: tproxy — до meta mark set, не после. Если на порту
+	# TPROXY нет слушателя (Xray упал, зависло в цикле рестартов), tproxy
+	# не переносит выполнение правила дальше — метка просто не ставится,
+	# и пакет уходит обычной пересылкой. Если бы метка стояла первой, она
+	# бы успевала выставиться ДО отказа tproxy — а дальше ip rule (в
+	# vless-tunnel-dns.init) заворачивает всё с этой меткой в table 100
+	# (local 0.0.0.0/0 dev lo), где слушателя на исходном адресе:порте
+	# нет — чёрная дыра для всего LAN на время падения Xray.
 	meta l4proto { tcp, udp } ip daddr @vless4 \
-		counter meta mark set __FWMARK__ tproxy ip to :__TPROXY_PORT__ accept
+		counter tproxy ip to :__TPROXY_PORT__ meta mark set __FWMARK__ accept
 
 	meta l4proto { tcp, udp } ip daddr @vless4_dns \
-		counter meta mark set __FWMARK__ tproxy ip to :__TPROXY_PORT__ accept
+		counter tproxy ip to :__TPROXY_PORT__ meta mark set __FWMARK__ accept
 }
 
 chain vless_prerouting6 {
@@ -111,8 +120,8 @@ chain vless_prerouting6 {
 	ip6 daddr @vless6_bypass return
 
 	meta l4proto { tcp, udp } ip6 daddr @vless6 \
-		counter meta mark set __FWMARK__ tproxy ip6 to :__TPROXY_PORT__ accept
+		counter tproxy ip6 to :__TPROXY_PORT__ meta mark set __FWMARK__ accept
 
 	meta l4proto { tcp, udp } ip6 daddr @vless6_dns \
-		counter meta mark set __FWMARK__ tproxy ip6 to :__TPROXY_PORT__ accept
+		counter tproxy ip6 to :__TPROXY_PORT__ meta mark set __FWMARK__ accept
 }

@@ -91,10 +91,29 @@ function redact(text) {
 }
 
 // --- обработка формы -----------------------------------------------------
+//
+// CSRF: без аутентификации простая cross-site форма (без preflight —
+// application/x-www-form-urlencoded, самый обычный POST) с любой чужой
+// страницы, открытой в браузере LAN-клиента, могла бы вслепую дёрнуть
+// action=off/set-link/save-domains. Origin/Referer подделать из формы на
+// чужом сайте браузер не даёт (это не то же самое, что заголовки самого
+// запроса, которые шлёт JS) — поэтому сверка с Host отсекает именно этот
+// класс атак. Токен не заводим: он потребовал бы серверного состояния
+// (сессий) ровно там, где осознанно решили обойтись без авторизации.
 let method = getenv('REQUEST_METHOD');
 let action_result = null;
 
-if (method == 'POST') {
+function same_origin() {
+	let host = getenv('HTTP_HOST') ?? '';
+	let origin = getenv('HTTP_ORIGIN');
+	let referer = getenv('HTTP_REFERER');
+	if (origin) return origin == 'http://' + host || origin == 'https://' + host;
+	if (referer) return index(referer, 'http://' + host + '/') == 0 ||
+		index(referer, 'https://' + host + '/') == 0;
+	return true;
+}
+
+if (method == 'POST' && same_origin()) {
 	let body = fs.stdin.read('all');
 	let f = parse_form(body);
 	if (f.action == 'set-link' && trim(f.link || '')) {

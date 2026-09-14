@@ -66,7 +66,17 @@ chain vless_prerouting {
 	# решает routing внутри config.json (см. `vless-tunnel _build-config`).
 	# Счётчик оставлен намеренно: по нему `vless-tunnel status`
 	# отличает «правил нет» от «правила есть, но трафик мимо».
-	meta l4proto { tcp, udp } counter meta mark set __FWMARK__ tproxy ip to :__TPROXY_PORT__ accept
+	#
+	# Порядок важен: tproxy — до meta mark set, не после. Если на порту
+	# TPROXY нет слушателя (Xray упал, зависло в цикле рестартов), tproxy
+	# не переносит выполнение правила дальше — метка просто не ставится,
+	# и пакет уходит обычной пересылкой. Если бы метка стояла первой, она
+	# бы успевала выставиться ДО отказа tproxy — а дальше ip rule (в
+	# vless-tunnel.init) заворачивает всё с этой меткой в table 100
+	# (local 0.0.0.0/0 dev lo), где слушателя на исходном адресе:порте
+	# нет — чёрная дыра для всего LAN на время падения Xray, а не просто
+	# отключение туннеля.
+	meta l4proto { tcp, udp } counter tproxy ip to :__TPROXY_PORT__ meta mark set __FWMARK__ accept
 }
 
 # Зеркало vless_prerouting для IPv6 — то же самое TPROXY-решение (весь
@@ -83,5 +93,5 @@ chain vless_prerouting6 {
 
 	ip6 daddr @vless6_bypass return
 
-	meta l4proto { tcp, udp } counter meta mark set __FWMARK__ tproxy ip6 to :__TPROXY_PORT__ accept
+	meta l4proto { tcp, udp } counter tproxy ip6 to :__TPROXY_PORT__ meta mark set __FWMARK__ accept
 }
