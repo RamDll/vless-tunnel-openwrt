@@ -820,6 +820,17 @@ function cmd_doctor() {
 		let listening = run_capture('netstat -ln 2>/dev/null | grep -q ":' + cfg.tproxy_port + ' "');
 		ok = check('служба работает — Xray слушает tproxy_port ' + cfg.tproxy_port, listening.code == 0,
 			listening.code == 0 ? null : 'порт не занят — Xray мог не подняться, см. logread') && ok;
+
+		// route_up() в init-скрипте заводит и то, и другое вместе — но это
+		// два отдельных объекта ядра, ничто не мешает одному пропасть без
+		// другого (например, руками почищенный `ip route flush table`).
+		let has_rule = run_capture('ip rule list | grep -q "fwmark ' + cfg.fwmark + ' lookup ' + cfg.table + '"');
+		ok = check('ip rule с fwmark ' + cfg.fwmark + ' на table ' + cfg.table + ' поднят', has_rule.code == 0,
+			has_rule.code == 0 ? null : 'перезапустите службу: vless-tunnel restart') && ok;
+
+		let has_route = run_capture('ip route list table ' + cfg.table + ' | grep -q "^local default"');
+		ok = check('local-маршрут в table ' + cfg.table + ' на месте', has_route.code == 0,
+			has_route.code == 0 ? null : 'перезапустите службу: vless-tunnel restart') && ok;
 	}
 
 	print(ok ? '\nвсё в порядке.\n' : '\nесть проблемы, см. выше.\n');
