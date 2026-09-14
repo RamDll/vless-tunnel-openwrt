@@ -123,7 +123,9 @@ DNS-ответа, а через **sniffing** прямо из TLS SNI / HTTP Host
   bypass — `return`, весь остальной TCP/UDP — `tproxy ip to :12345`.
   Решение по домену/IP из списков внутри этого TPROXY уже не принимается
   здесь — им занимается `routing.rules` в `config.json` (см. ниже).
-  `vless_forward6` глушит IPv6 как раньше.
+  `vless_prerouting6` — зеркало для IPv6, тоже перехватывает и заворачивает
+  в TPROXY (см. «IPv6 — реализовано и проверено» ниже; старый `vless_forward6`,
+  который просто глушил IPv6, из кода убран).
 - `vless-tunnel.init` → `/etc/init.d/vless-tunnel` — procd. На каждом
   старте зовёт `vless-tunnel _build-config` (пересобирает `config.json` из
   сохранённой в UCI ссылки + текущих `domains`/`subnets` — так правки в

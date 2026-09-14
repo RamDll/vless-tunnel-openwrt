@@ -130,7 +130,6 @@ fi
 # --- этап 3: файлы проекта -------------------------------------------------
 
 log "устанавливаю файлы"
-cp "$WORK_DIR/10-vless-tunnel-dns.nft" /etc/nftables.d/10-vless-tunnel.nft
 cp "$WORK_DIR/vless-tunnel-dns.init" /etc/init.d/vless-tunnel
 chmod 0755 /etc/init.d/vless-tunnel
 cp "$WORK_DIR/vless-tunnel-dns" /usr/bin/vless-tunnel
@@ -141,6 +140,16 @@ if [ -f /etc/config/vless-tunnel ]; then
 else
 	cp "$WORK_DIR/vless-tunnel-dns.config" /etc/config/vless-tunnel
 fi
+
+# nft-файл — шаблон: __LAN_IFACE__/__FWMARK__/__TPROXY_PORT__ подставляются
+# из UCI (те же значения, что читает vless-tunnel-dns.init для `ip rule` и
+# сам Xray для listen-порта) — иначе при смене этих настроек nft-правила
+# молча расходятся с тем, что реально слушает/маркирует остальная система.
+LAN_IFACE=$(uci -q get vless-tunnel.main.lan || true); LAN_IFACE=${LAN_IFACE:-br-lan}
+FWMARK=$(uci -q get vless-tunnel.main.fwmark || true); FWMARK=${FWMARK:-0x1e5}
+TPROXY_PORT=$(uci -q get vless-tunnel.main.tproxy_port || true); TPROXY_PORT=${TPROXY_PORT:-12345}
+sed -e "s/__LAN_IFACE__/$LAN_IFACE/g" -e "s/__FWMARK__/$FWMARK/g" -e "s/__TPROXY_PORT__/$TPROXY_PORT/g" \
+	"$WORK_DIR/10-vless-tunnel-dns.nft" > /etc/nftables.d/10-vless-tunnel.nft
 
 # Снэпшот доменов/подсетей (itdoginfo/allow-domains на момент сборки
 # этого install-dns.sh) — тоже не трогаем, если список уже свой, набранный
@@ -180,7 +189,6 @@ fi
 log "подключаю nftables-правила"
 nft delete chain inet fw4 vless_prerouting 2>/dev/null || true
 nft delete chain inet fw4 vless_prerouting6 2>/dev/null || true
-nft delete chain inet fw4 vless_forward6 2>/dev/null || true
 {
 	echo 'table inet fw4 {'
 	cat /etc/nftables.d/10-vless-tunnel.nft

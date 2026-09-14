@@ -12,7 +12,6 @@
 import * as fs from 'fs';
 import * as uci from 'uci';
 
-const APP = 'vless-tunnel';
 const UCI_CONF = 'vless-tunnel';
 const CONFIG_DIR = '/etc/vless-tunnel';
 const CONFIG_JSON = CONFIG_DIR + '/config.json';
@@ -24,9 +23,6 @@ const NFT_FILE = '/etc/nftables.d/10-vless-tunnel.nft';
 const XRAY_BIN = '/usr/bin/xray';
 const TEST_PORT = 18080;
 const TEST_TARGET = '1.1.1.1';
-
-const NETWORKS = ['tcp', 'raw', 'ws', 'grpc', 'http', 'h2', 'quic', 'kcp',
-                   'httpupgrade', 'xhttp', 'splithttp'];
 
 function fail(msg) {
 	die(msg);
@@ -466,7 +462,7 @@ function cfg_defaults() {
 	return {
 		enabled: '0', link: '', lan: 'br-lan', tproxy_port: '12345',
 		fwmark: '0x1e5', table: '100',
-		domains: DOMAINS_DEFAULT, subnets: SUBNETS_DEFAULT, ipv6: 'block',
+		domains: DOMAINS_DEFAULT, subnets: SUBNETS_DEFAULT,
 	};
 }
 
@@ -839,7 +835,7 @@ function cmd_uninstall() {
 		run_capture(INIT_SCRIPT + ' stop');
 		run_capture(INIT_SCRIPT + ' disable');
 	}
-	for (let name in ['vless_prerouting', 'vless_prerouting6', 'vless_forward6'])
+	for (let name in ['vless_prerouting', 'vless_prerouting6'])
 		system('nft delete chain inet fw4 ' + name + ' 2>/dev/null');
 	for (let name in ['vless4_bypass', 'vless6_bypass'])
 		system('nft delete set inet fw4 ' + name + ' 2>/dev/null');

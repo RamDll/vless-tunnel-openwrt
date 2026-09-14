@@ -5,6 +5,12 @@
 # восстанавливаются сами при `fw4 reload`, рестарте сети и поднятии WAN:
 # отдельный сторож не нужен.
 #
+# __LAN_IFACE__/__FWMARK__/__TPROXY_PORT__ — плейсхолдеры. install.sh
+# подставляет в них значения из UCI (vless-tunnel.main.lan/fwmark/
+# tproxy_port, те же, что использует vless-tunnel.init для `ip rule`
+# и сам Xray для listen-порта) один раз, при установке файла в
+# /etc/nftables.d/ — сам этот файл в репозитории неисполняемый шаблон.
+#
 # Проверить, что подхватилось:  nft list ruleset | grep -A20 vless
 #
 # Архитектура сменилась: раньше решение "туда или напрямую" принималось
@@ -43,7 +49,7 @@ chain vless_prerouting {
 	# Только трафик клиентов из LAN. Трафик самого роутера сюда не
 	# попадает (он идёт через output), поэтому петля невозможна
 	# и не нужно исключать Xray по uid.
-	iifname != "br-lan" return
+	iifname != "__LAN_IFACE__" return
 
 	# Служебное и локальное — всегда напрямую. Сюда же попадает
 	# обращение к самому роутеру: DNS на 53, LuCI, SSH.
@@ -60,7 +66,7 @@ chain vless_prerouting {
 	# решает routing внутри config.json (см. `vless-tunnel _build-config`).
 	# Счётчик оставлен намеренно: по нему `vless-tunnel status`
 	# отличает «правил нет» от «правила есть, но трафик мимо».
-	meta l4proto { tcp, udp } counter meta mark set 0x1e5 tproxy ip to :12345 accept
+	meta l4proto { tcp, udp } counter meta mark set __FWMARK__ tproxy ip to :__TPROXY_PORT__ accept
 }
 
 # Зеркало vless_prerouting для IPv6 — то же самое TPROXY-решение (весь
@@ -71,11 +77,11 @@ chain vless_prerouting {
 chain vless_prerouting6 {
 	type filter hook prerouting priority mangle; policy accept;
 
-	iifname != "br-lan" return
+	iifname != "__LAN_IFACE__" return
 
 	ip6 daddr { ::1/128, fe80::/10, fc00::/7, ff00::/8 } return
 
 	ip6 daddr @vless6_bypass return
 
-	meta l4proto { tcp, udp } counter meta mark set 0x1e5 tproxy ip6 to :12345 accept
+	meta l4proto { tcp, udp } counter meta mark set __FWMARK__ tproxy ip6 to :__TPROXY_PORT__ accept
 }

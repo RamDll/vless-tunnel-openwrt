@@ -18,7 +18,6 @@
 import * as fs from 'fs';
 import * as uci from 'uci';
 
-const APP = 'vless-tunnel';
 const UCI_CONF = 'vless-tunnel';
 const CONFIG_DIR = '/etc/vless-tunnel';
 const CONFIG_JSON = CONFIG_DIR + '/config.json';
@@ -31,9 +30,6 @@ const DNSMASQ_CONF = '/tmp/dnsmasq.d/vless-tunnel.conf';
 const XRAY_BIN = '/usr/bin/xray';
 const TEST_PORT = 18080;
 const TEST_TARGET = '1.1.1.1';
-
-const NETWORKS = ['tcp', 'raw', 'ws', 'grpc', 'http', 'h2', 'quic', 'kcp',
-                   'httpupgrade', 'xhttp', 'splithttp'];
 
 function fail(msg) {
 	die(msg);
@@ -449,7 +445,7 @@ function cfg_defaults() {
 	return {
 		enabled: '0', link: '', lan: 'br-lan', tproxy_port: '12345',
 		fwmark: '0x1e5', table: '100',
-		domains: DOMAINS_DEFAULT, subnets: SUBNETS_DEFAULT, ipv6: 'block',
+		domains: DOMAINS_DEFAULT, subnets: SUBNETS_DEFAULT,
 	};
 }
 
@@ -838,7 +834,10 @@ function cmd_uninstall() {
 
 	fs.unlink(NFT_FILE);
 	fs.unlink(DNSMASQ_CONF);
-	run_capture('/etc/init.d/dnsmasq reload');
+	// restart, не reload — SIGHUP не пересобирает внутреннюю структуру
+	// сопоставления доменов для nftset=, dnsmasq продолжит дёргать уже
+	// удалённые выше сеты (см. dns_up()/dns_down() в vless-tunnel-dns.init).
+	run_capture('/etc/init.d/dnsmasq restart');
 
 	system('rm -rf ' + CONFIG_DIR);
 	system('uci -q delete ' + UCI_CONF + '.main; uci commit ' + UCI_CONF);
