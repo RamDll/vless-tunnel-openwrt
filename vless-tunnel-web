@@ -96,15 +96,37 @@ function redact(text) {
 // application/x-www-form-urlencoded, самый обычный POST) с любой чужой
 // страницы, открытой в браузере LAN-клиента, могла бы вслепую дёрнуть
 // action=off/set-link/save-domains. Origin/Referer подделать из формы на
-// чужом сайте браузер не даёт (это не то же самое, что заголовки самого
-// запроса, которые шлёт JS) — поэтому сверка с Host отсекает именно этот
-// класс атак. Токен не заводим: он потребовал бы серверного состояния
-// (сессий) ровно там, где осознанно решили обойтись без авторизации.
+// чужом сайте браузер не даёт — но одной сверки Origin с Host мало: DNS
+// rebinding (evil.com с коротким TTL перепривязывается на IP роутера)
+// даёт Origin: http://evil.com и Host: evil.com одновременно — они
+// совпадут, а запрос всё равно чужой. Поэтому дополнительно требуем,
+// чтобы сам Host был IP-литералом: страница на роутер попадает только
+// по адресу вида http://192.168.1.1/t.html (см. README), доменного
+// имени тут не бывает в принципе — Host вида "evil.com" отсекается
+// этим одним, независимо от того, что показывает Origin. Токен не
+// заводим: он потребовал бы серверного состояния (сессий) ровно там,
+// где осознанно решили обойтись без авторизации.
 let method = getenv('REQUEST_METHOD');
 let action_result = null;
 
+function is_ipv4_literal(s) {
+	return match(s, /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) != null;
+}
+
+// Host из HTTP-запроса: "1.2.3.4", "1.2.3.4:80", "[::1]" или "[::1]:80".
+// Скобки в Host по HTTP-грамматике бывают только вокруг IPv6-литерала —
+// само их наличие уже достаточно, доменное имя так не пишут.
+function host_is_ip_literal(host) {
+	host = '' + (host ?? '');
+	if (substr(host, 0, 1) == '[') return index(host, ']') > 0;
+	let colon = index(host, ':');
+	if (colon >= 0) host = substr(host, 0, colon);
+	return is_ipv4_literal(host);
+}
+
 function same_origin() {
 	let host = getenv('HTTP_HOST') ?? '';
+	if (!host_is_ip_literal(host)) return false;
 	let origin = getenv('HTTP_ORIGIN');
 	let referer = getenv('HTTP_REFERER');
 	if (origin) return origin == 'http://' + host || origin == 'https://' + host;

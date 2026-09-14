@@ -64,8 +64,12 @@ chain vless_prerouting {
 	# Весь остальной TCP/UDP — в Xray. Что из этого реально уйдёт в
 	# туннель, а что просто пройдёт транзитом через Xray напрямую —
 	# решает routing внутри config.json (см. `vless-tunnel _build-config`).
-	# Счётчик оставлен намеренно: по нему `vless-tunnel status`
-	# отличает «правил нет» от «правила есть, но трафик мимо».
+	#
+	# Два счётчика намеренно: первый — сколько пакетов подошло под
+	# правило вообще, второй (после tproxy+mark) — сколько реально
+	# перехватилось. Если Xray не слушает, первый растёт, а второй
+	# нет — так `vless-tunnel status`/`doctor` отличают «правил нет» от
+	# «правила есть, но трафик мимо» (fail-open, не чёрная дыра — см. ниже).
 	#
 	# Порядок важен: tproxy — до meta mark set, не после. Если на порту
 	# TPROXY нет слушателя (Xray упал, зависло в цикле рестартов), tproxy
@@ -76,7 +80,7 @@ chain vless_prerouting {
 	# (local 0.0.0.0/0 dev lo), где слушателя на исходном адресе:порте
 	# нет — чёрная дыра для всего LAN на время падения Xray, а не просто
 	# отключение туннеля.
-	meta l4proto { tcp, udp } counter tproxy ip to :__TPROXY_PORT__ meta mark set __FWMARK__ accept
+	meta l4proto { tcp, udp } counter tproxy ip to :__TPROXY_PORT__ meta mark set __FWMARK__ counter accept
 }
 
 # Зеркало vless_prerouting для IPv6 — то же самое TPROXY-решение (весь
@@ -93,5 +97,5 @@ chain vless_prerouting6 {
 
 	ip6 daddr @vless6_bypass return
 
-	meta l4proto { tcp, udp } counter tproxy ip6 to :__TPROXY_PORT__ meta mark set __FWMARK__ accept
+	meta l4proto { tcp, udp } counter tproxy ip6 to :__TPROXY_PORT__ meta mark set __FWMARK__ counter accept
 }

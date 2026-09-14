@@ -694,6 +694,18 @@ function cmd_status() {
 
 	print('служба: ' + (service_running() ? 'работает' : 'остановлена') + '\n');
 
+	// После перестановки tproxy/meta mark set (см. .nft) падение Xray при
+	// enabled=1 больше не кладёт весь LAN (fail-open вместо чёрной дыры) —
+	// но это значит, что трафик из списков молча идёт мимо туннеля, пока
+	// никто не заметил. doctor это ловит, но его надо специально
+	// запустить — здесь то же самое видно сразу, без лишнего шага.
+	if (cfg.enabled == '1' && service_running()) {
+		let listening = run_capture('netstat -ln 2>/dev/null | grep -q ":' + cfg.tproxy_port + ' "');
+		if (listening.code != 0)
+			print('ВНИМАНИЕ: служба помечена работающей, но Xray не слушает tproxy_port ' +
+				cfg.tproxy_port + ' — перехваченный трафик идёт мимо туннеля напрямую\n');
+	}
+
 	let rule = run_capture('ip rule list');
 	let routed = index(rule.output, 'fwmark ' + cfg.fwmark) >= 0;
 	print('policy routing (' + cfg.fwmark + '/' + cfg.table + '): ' +
