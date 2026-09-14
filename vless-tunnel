@@ -59,8 +59,18 @@ function hex_to_int(s) {
 // сравнение по значению (hex_to_int), не строкой: "0x1e5"/"0x01e5"/"485"
 // в UCI значат одно и то же, а `ip rule` печатает нормализованно.
 function has_fwmark_rule(text, mark, table) {
-	let m = match(text ?? '', /fwmark (0x[0-9a-fA-F]+) lookup ([0-9]+)/);
-	return !!(m && hex_to_int(m[1]) == hex_to_int(mark) && int(m[2]) == int(table));
+	// match() без /g вернул бы только первое совпадение во всём выводе —
+	// правила печатаются по возрастанию priority, и чужое fwmark-правило
+	// с меньшим приоритетом (mwan3, форк podkop — оба заводят свои)
+	// встало бы в выводе раньше и подменило бы собой то, что реально
+	// проверяем. Идём по строкам, ищем среди всех.
+	for (let line in split(text ?? '', '
+')) {
+		let m = match(line, /fwmark (0x[0-9a-fA-F]+) lookup ([0-9]+)/);
+		if (m && hex_to_int(m[1]) == hex_to_int(mark) && int(m[2]) == int(table))
+			return true;
+	}
+	return false;
 }
 
 function pct_decode(s, plus_space) {
