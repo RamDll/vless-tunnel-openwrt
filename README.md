@@ -54,6 +54,7 @@ vless-tunnel test            # проверить связь с сервером
 vless-tunnel doctor          # диагностика окружения
 vless-tunnel add-domain <d>  # добавить домен в список
 vless-tunnel remove-domain <d>
+vless-tunnel help            # список всех команд
 ```
 
 Веб-интерфейс: `http://192.168.1.1/t.html` (без пароля, только LAN; замените на IP своего роутера, если он другой).

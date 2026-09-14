@@ -858,8 +858,8 @@ function cmd_uninstall() {
 		' не тронуты — уберите вручную при необходимости.\n');
 }
 
-function usage() {
-	warn('использование: vless-tunnel <команда> [аргументы]\n\n' +
+function usage_text() {
+	return 'использование: vless-tunnel <команда> [аргументы]\n\n' +
 		'  setup [ссылка]        подготовить рабочие файлы, опционально задать ссылку\n' +
 		'  set-link <ссылка>     разобрать ссылку, проверить и сохранить конфигурацию\n' +
 		'  on / off              включить / выключить туннель\n' +
@@ -870,9 +870,18 @@ function usage() {
 		'  add-domain <домен>    добавить домен в список\n' +
 		'  remove-domain <домен> убрать домен из списка\n' +
 		'  uninstall             удалить конфигурацию и правила\n' +
+		'  help                  показать эту справку\n' +
 		'  parse <ссылка>        разобрать ссылку и напечатать разбор (отладка)\n' +
-		'  make <ссылка> <файл>  собрать config.json в указанный файл (отладка)\n');
+		'  make <ссылка> <файл>  собрать config.json в указанный файл (отладка)\n';
+}
+
+function usage() {
+	warn(usage_text());
 	exit(2);
+}
+
+function cmd_help() {
+	print(usage_text());
 }
 
 let args = ARGV;
@@ -916,6 +925,8 @@ try {
 	} else if (cmd == '_set-domains-file') {
 		if (length(args) < 2) usage();
 		cmd_set_domains_file(args[1]);
+	} else if (cmd == 'help' || cmd == '-h' || cmd == '--help') {
+		cmd_help();
 	} else {
 		warn('неизвестная команда: ' + cmd + '\n');
 		usage();
