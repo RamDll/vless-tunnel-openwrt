@@ -43,6 +43,21 @@ set vless6_bypass {
 	comment "vless-tunnel: принудительно напрямую, минуя Xray (IPv6)"
 }
 
+# Адреса самого сервера туннеля — тоже мимо Xray. Иначе десктопный клиент
+# или VPN-приложение на телефоне с той же ссылкой заворачиваются в туннель
+# роутера и не работают вовсе (см. HANDOFF.md, «туннель в туннеле»).
+# Здесь сеты пустые; элементы дописывает `vless-tunnel _build-config` при
+# каждом старте службы — в живой ruleset и в 11-vless-tunnel-server.nft,
+# который fw4 инклюдит после этого файла. Тот файл объявляет те же сеты
+# повторно, уже с elements, — поэтому объявления здесь и там должны
+# совпадать (тип, без flags и comment).
+set vless4_server {
+	type ipv4_addr
+}
+set vless6_server {
+	type ipv6_addr
+}
+
 chain vless_prerouting {
 	type filter hook prerouting priority mangle; policy accept;
 
@@ -59,6 +74,7 @@ chain vless_prerouting {
 		224.0.0.0/4, 240.0.0.0/4
 	} return
 
+	ip daddr @vless4_server return
 	ip daddr @vless4_bypass return
 
 	# Весь остальной TCP/UDP — в Xray. Что из этого реально уйдёт в
@@ -95,6 +111,7 @@ chain vless_prerouting6 {
 
 	ip6 daddr { ::1/128, fe80::/10, fc00::/7, ff00::/8 } return
 
+	ip6 daddr @vless6_server return
 	ip6 daddr @vless6_bypass return
 
 	meta l4proto { tcp, udp } counter tproxy ip6 to :__TPROXY_PORT__ meta mark set __FWMARK__ counter accept

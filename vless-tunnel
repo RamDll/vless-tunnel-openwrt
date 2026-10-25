@@ -3,9 +3,9 @@
 //
 // Разбор vless:// перенесён с Python (github.com/RamDll/vless-tunnel,
 // vless-tunnel.sh) на ucode. Архитектура: TPROXY в nftables перехватывает
-// ВЕСЬ TCP/UDP из LAN (кроме приватных сетей и ручного bypass), а решение
-// "туннель или напрямую" принимает Xray через sniffing SNI/TLS — не через
-// DNS. Два режима: whitelist (в туннель только domains/subnets) и proxy
+// ВЕСЬ TCP/UDP из LAN (кроме приватных сетей, самого сервера туннеля и
+// ручного bypass), а решение "туннель или напрямую" принимает Xray через
+// sniffing SNI/TLS — не через DNS. Два режима: whitelist (в туннель только domains/subnets) и proxy
 // (в туннель весь веб, кроме RU-доменов/адресов и direct-domains; для
 // последнего нужен geoip.dat, geosite.dat не используется).
 // См. HANDOFF.md, "Архитектурные решения" и "Режим proxy".
@@ -27,6 +27,12 @@ const GEOIP_URL = 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/late
 const SELF_BIN = '/usr/bin/vless-tunnel';
 const INIT_SCRIPT = '/etc/init.d/vless-tunnel';
 const NFT_FILE = '/etc/nftables.d/10-vless-tunnel.nft';
+// IP самого сервера туннеля для сетов vless4_server/vless6_server — пишется
+// при каждой пересборке config.json (см. sync_server_bypass). Имя
+// сортируется после NFT_FILE: fw4 инклюдит /etc/nftables.d/*.nft по
+// алфавиту, а сеты сначала должны быть объявлены там, где на них
+// ссылаются цепочки.
+const SERVER_NFT_FILE = '/etc/nftables.d/11-vless-tunnel-server.nft';
 const XRAY_BIN = '/usr/bin/xray';
 // geoip.dat (mode=proxy) Xray ищет по XRAY_LOCATION_ASSET. Служба получает
 // переменную из init-скрипта, но все проверочные запуски (`xray -test`,
@@ -423,6 +429,13 @@ function build_config(p, o) {
 	let ipRules = o.subnets || [];
 
 	let rules = [];
+	// Сервер туннеля — напрямую, первым правилом. Основной обход — в
+	// nftables (vless4_server, трафик до Xray вообще не доходит); это
+	// страховка на случай, если сеты не обновились. Работает только при
+	// routeOnly=1: при 0 у sniffed-соединения вместо IP уже домен.
+	if (length(o.server_ips))
+		push(rules, { type: 'field', ip: o.server_ips, outboundTag: 'direct' });
+
 	// Явные исключения «всегда напрямую» — раньше остальных правил.
 	// Сюда попадает то, что должно идти мимо туннеля даже при mode=proxy:
 	// банки/госуслуги, сервисы с капчей на датацентровый IP, большие CDN,
@@ -449,7 +462,7 @@ function build_config(p, o) {
 			push(rules, { type: 'field', ip: ['geoip:ru'], outboundTag: 'direct' });
 
 		// Весь остальной веб — в туннель. Нестандартные порты остаются
-		// direct (торренты, игры, ssh не гоняем через userspace); если
+		// direct (торренты, игры, ssh не гоняем через туннель); если
 		// такой сервис заблокирован — его IP добавляется в subnets.
 		push(rules, { type: 'field', network: 'tcp', port: '80,443,8443', outboundTag: 'proxy' });
 		push(rules, { type: 'field', network: 'udp', port: '443', outboundTag: 'proxy' });
@@ -470,8 +483,15 @@ function build_config(p, o) {
 	let sniffing = { enabled: true, destOverride: ['http', 'tls', 'quic'],
 		routeOnly: route_only };
 
+	// Access-лог (строка на КАЖДОЕ соединение) Xray без явного `access`
+	// пишет в stdout, а procd — в syslog: при торрентах это тысячи строк в
+	// минуту в logd. Нужен он только для отладки маршрутизации.
+	let log_level = o.log_level || 'warning';
+	let log = { loglevel: log_level };
+	if (!(log_level in { debug: 1, info: 1 })) log.access = 'none';
+
 	return {
-		log: { loglevel: o.log_level || 'warning' },
+		log: log,
 		inbounds: [{
 			tag: 'tproxy-in',
 			// TPROXY доставляет пакет "локально" по destination IP клиента,
@@ -550,6 +570,80 @@ function port_listening(port) {
 		}
 	}
 	return false;
+}
+
+// --- сервер туннеля — мимо Xray -----------------------------------------
+// Трафик LAN к самому серверу туннеля не должен попадать в Xray роутера.
+// Десктопный клиент или VPN-приложение на телефоне с той же ссылкой ходят
+// на этот же сервер, и роутер заворачивал их соединения в свой туннель:
+// REALITY-маскировка (SNI вроде www.sap.com) совпадала с domains, а в
+// mode=proxy под «весь веб — в proxy» попадает вообще любое такое
+// соединение. Сервер, получив его изнутри туннеля, по sniffing подменял
+// адрес назначения на настоящий www.sap.com — клиент видел чужой
+// сертификат и рвал связь. Итог — «за роутером не работает ничего».
+// См. HANDOFF.md, «Тест 25.10.2026: туннель в туннеле».
+
+// Адреса сервера из ссылки. Домен резолвится DNS самого роутера (busybox
+// nslookup); при неудаче — пустой список, вызывающий решает, что делать.
+function server_ips(p) {
+	if (p.host_is_ip) return [p.host];
+	// host идёт в командную строку — пускаем только то, что похоже на имя
+	if (!match(p.host, /^[A-Za-z0-9.-]+$/)) return [];
+	let r = run_capture('nslookup ' + p.host);
+	if (r.code != 0) return [];
+	let ips = [], answer = false;
+	for (let line in split(r.output, '\n')) {
+		// до "Name:" идут строки самого DNS-сервера (Address: 127.0.0.1:53)
+		if (match(line, /^Name:/)) answer = true;
+		let m = answer ? match(line, /^Address:[ \t]*([0-9A-Fa-f.:]+)[ \t]*$/) : null;
+		if (m && is_ip(m[1]) && !(m[1] in ips)) push(ips, m[1]);
+	}
+	return ips;
+}
+
+function nft_set_decl(name, type, ips) {
+	return 'set ' + name + ' {\n\ttype ' + type + '\n' +
+		(length(ips) ? '\telements = { ' + join(', ', ips) + ' }\n' : '') + '}\n';
+}
+
+// Кладёт адреса сервера в vless4_server/vless6_server: в живой ruleset —
+// сразу, и в SERVER_NFT_FILE — чтобы они пережили `fw4 reload` и
+// перезагрузку (fw4 пересобирает таблицу из /etc/nftables.d с нуля, и
+// добавленные на лету элементы пропадают). Сами сеты объявлены пустыми в
+// NFT_FILE; здесь они объявляются повторно уже с элементами — для nft это
+// add, элементы добавляются к существующему сету.
+function sync_server_bypass(ips) {
+	let v4 = filter(ips, is_ipv4), v6 = filter(ips, (a) => !is_ipv4(a));
+	let decl = nft_set_decl('vless4_server', 'ipv4_addr', v4) +
+		nft_set_decl('vless6_server', 'ipv6_addr', v6);
+
+	let tmp = '/tmp/vless-tunnel-server.nft';
+	write_file(tmp, 'table inet fw4 {\n' + decl + '}\n');
+	let chk = run_capture('nft -c -f ' + tmp);
+	if (chk.code != 0) {
+		fs.unlink(tmp);
+		warn('предупреждение: IP сервера не добавлен в обход Xray (nft отверг):\n' + chk.output);
+		return false;
+	}
+
+	let body = '# сгенерировано vless-tunnel _build-config, не править\n' + decl;
+	if (read_file(SERVER_NFT_FILE) != body)
+		write_file(SERVER_NFT_FILE, body);
+
+	// flush + add одной транзакцией: старый адрес (после set-link на другой
+	// сервер) не остаётся висеть в обходе
+	let live = 'flush set inet fw4 vless4_server\nflush set inet fw4 vless6_server\n';
+	if (length(v4)) live += 'add element inet fw4 vless4_server { ' + join(', ', v4) + ' }\n';
+	if (length(v6)) live += 'add element inet fw4 vless6_server { ' + join(', ', v6) + ' }\n';
+	write_file(tmp, live);
+	let r = run_capture('nft -f ' + tmp);
+	fs.unlink(tmp);
+	if (r.code != 0) {
+		warn('предупреждение: живые сеты vless4_server/vless6_server не обновлены — ' +
+			'nft-файл старый? переустановите (sh install.sh):\n' + r.output);
+		return false;
+	}
+	return true;
 }
 
 // --- UCI: /etc/config/vless-tunnel --------------------------------------
@@ -672,7 +766,9 @@ function cmd_make(link, out_path) {
 // выше по файлу.
 function cmd_set_link(link) {
 	let p = parse_link(link);
-	let cfg = build_config(p, default_opts());
+	let o = default_opts();
+	o.server_ips = server_ips(p);
+	let cfg = build_config(p, o);
 	let tmp = '/tmp/vless-tunnel-check.json';
 	write_file(tmp, sprintf('%.J\n', cfg));
 
@@ -716,7 +812,9 @@ function cmd_build_config() {
 	let cfg = cfg_get_all();
 	if (!cfg.link) fail('ссылка не задана — vless-tunnel set-link "vless://..."');
 	let p = parse_link(cfg.link);
-	let built = sprintf('%.J\n', build_config(p, default_opts()));
+	let o = default_opts();
+	o.server_ips = server_ips(p);
+	let built = sprintf('%.J\n', build_config(p, o));
 	let tmp = '/tmp/vless-tunnel-check.json';
 	write_file(tmp, built);
 
@@ -730,6 +828,14 @@ function cmd_build_config() {
 
 	ensure_dir(CONFIG_DIR);
 	write_config_json(built);
+
+	// Домен сервера не отрезолвился (например, WAN при загрузке ещё не
+	// поднят) — прежние адреса в обходе лучше пустого списка.
+	if (length(o.server_ips))
+		sync_server_bypass(o.server_ips);
+	else
+		warn('предупреждение: адрес сервера ' + p.host + ' не отрезолвился — ' +
+			'обход Xray для него не обновлён\n');
 }
 
 function cmd_setup(link) {
@@ -918,14 +1024,29 @@ function cmd_doctor() {
 	}
 
 	ok = check('ссылка сервера задана', cfg.link != '') && ok;
+	let p = null;
 	if (cfg.link) {
 		try {
-			parse_link(cfg.link);
+			p = parse_link(cfg.link);
 			check('ссылка разбирается корректно', true);
 		} catch (e) {
 			check('ссылка разбирается корректно', false, e.message);
 			ok = false;
 		}
+	}
+
+	// Без этого клиенты LAN с той же ссылкой (десктопный VLESS, VPN на
+	// телефоне) заворачиваются в туннель роутера и не работают вовсе.
+	if (p && chain.code == 0) {
+		let ips = server_ips(p);
+		let sets = run_capture('nft list set inet fw4 vless4_server; nft list set inet fw4 vless6_server').output;
+		let elems = map(match(sets, /[0-9A-Fa-f]*[.:][0-9A-Fa-f.:]+/g) ?? [], (m) => m[0]);
+		let missing = filter(ips, (a) => !(a in elems));
+		let in_set = length(ips) && !length(missing);
+		ok = check('сервер ' + p.host + ' идёт мимо Xray (vless4_server/vless6_server)', in_set,
+			in_set ? null : !length(ips) ? 'адрес сервера не резолвится' :
+				'нет ' + join(', ', missing) + ' — /etc/init.d/vless-tunnel restart' +
+				(fs.access(SERVER_NFT_FILE) ? '' : '; если не поможет — переустановите (sh install.sh)')) && ok;
 	}
 
 	ok = check('режим: ' + (cfg.mode == 'proxy' ? 'proxy' : 'whitelist'), true) && ok;
@@ -1163,10 +1284,11 @@ function cmd_uninstall() {
 	}
 	for (let name in ['vless_prerouting', 'vless_prerouting6'])
 		system('nft delete chain inet fw4 ' + name + ' 2>/dev/null');
-	for (let name in ['vless4_bypass', 'vless6_bypass'])
+	for (let name in ['vless4_bypass', 'vless6_bypass', 'vless4_server', 'vless6_server'])
 		system('nft delete set inet fw4 ' + name + ' 2>/dev/null');
 
 	fs.unlink(NFT_FILE);
+	fs.unlink(SERVER_NFT_FILE);
 
 	system('rm -rf ' + CONFIG_DIR);
 	system('uci -q delete ' + UCI_CONF + '.main; uci commit ' + UCI_CONF);

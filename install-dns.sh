@@ -190,6 +190,11 @@ fi
 log "подключаю nftables-правила"
 nft delete chain inet fw4 vless_prerouting 2>/dev/null || true
 nft delete chain inet fw4 vless_prerouting6 2>/dev/null || true
+# Остатки sniffing-варианта: обход IP сервера (там весь LAN идёт через
+# Xray, здесь в TPROXY попадают только адреса из списков — он не нужен).
+rm -f /etc/nftables.d/11-vless-tunnel-server.nft
+nft delete set inet fw4 vless4_server 2>/dev/null || true
+nft delete set inet fw4 vless6_server 2>/dev/null || true
 {
 	echo 'table inet fw4 {'
 	cat /etc/nftables.d/10-vless-tunnel.nft
