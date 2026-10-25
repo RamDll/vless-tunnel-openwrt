@@ -20,8 +20,9 @@
 #   sh install-dns.sh                  установить, ссылку задать потом
 #   sh install-dns.sh "vless://..."    установить и сразу задать ссылку
 #
-# Ставит снэпшот domains/subnets (если их там ещё нет) и по возможности —
-# https-dns-proxy для DoH-резолва самого роутера (см. HANDOFF.md).
+# Ставит снэпшот domains/subnets (если их там ещё нет). DoH
+# (https-dns-proxy) по умолчанию не ставится — только с VLESS_TUNNEL_DOH=1
+# (см. HANDOFF.md, «DNS роутера в сторону апстрима»).
 
 set -e
 
@@ -227,28 +228,35 @@ fi
 # встал (например, конфликт с forkop — apk объявляет `breaks` между ними),
 # не валим всю установку — см. HANDOFF.md, "DNS роутера в сторону
 # апстрима".
-if apk info -e https-dns-proxy >/dev/null 2>&1; then
-	log "https-dns-proxy уже установлен — не трогаю"
-elif apk add https-dns-proxy >/tmp/vless-tunnel-doh-install.log 2>&1; then
-	log "https-dns-proxy установлен — настраиваю (Cloudflare, без force_dns)"
-	uci -q delete https-dns-proxy.@https-dns-proxy[1] || true
-	uci set https-dns-proxy.config.force_dns='0'
-	uci commit https-dns-proxy
-	uci -q del_list dhcp.@dnsmasq[0].server='127.0.0.1#5054' || true
-	uci -q del_list dhcp.@dnsmasq[0].doh_server='127.0.0.1#5054' || true
-	uci -q del_list dhcp.@dnsmasq[0].doh_backup_server='127.0.0.1#5054' || true
-	uci commit dhcp
-	# apk add у https-dns-proxy сам стартует службу через post-install —
-	# следующие restart иногда ловят гонку за procd-локом с этим уже
-	# идущим стартом и возвращают ошибку (не зависают, но нефатально:
-	# конфиг уже применён выше, а служба и так поднята постинстом). Не
-	# валим весь install ради этого — DoH в любом случае уже настроен.
-	/etc/init.d/https-dns-proxy enable || true
-	/etc/init.d/https-dns-proxy restart || log "предупреждение: https-dns-proxy restart вернул ошибку (гонка с post-install), служба и так должна быть поднята"
-	/etc/init.d/dnsmasq restart || log "предупреждение: dnsmasq restart вернул ошибку, перезапустите вручную при необходимости"
+# DoH теперь opt-in (см. install.sh): глобальный https-dns-proxy периодически
+# ломал резолв, а для этой задачи не обязателен. Включается явно:
+# VLESS_TUNNEL_DOH=1 sh install-dns.sh
+if [ "${VLESS_TUNNEL_DOH:-0}" = "1" ]; then
+	if apk info -e https-dns-proxy >/dev/null 2>&1; then
+		log "https-dns-proxy уже установлен — не трогаю"
+	elif apk add https-dns-proxy >/tmp/vless-tunnel-doh-install.log 2>&1; then
+		log "https-dns-proxy установлен — настраиваю (Cloudflare, без force_dns)"
+		uci -q delete https-dns-proxy.@https-dns-proxy[1] || true
+		uci set https-dns-proxy.config.force_dns='0'
+		uci commit https-dns-proxy
+		uci -q del_list dhcp.@dnsmasq[0].server='127.0.0.1#5054' || true
+		uci -q del_list dhcp.@dnsmasq[0].doh_server='127.0.0.1#5054' || true
+		uci -q del_list dhcp.@dnsmasq[0].doh_backup_server='127.0.0.1#5054' || true
+		uci commit dhcp
+		# apk add у https-dns-proxy сам стартует службу через post-install —
+		# следующие restart иногда ловят гонку за procd-локом с этим уже
+		# идущим стартом и возвращают ошибку (не зависают, но нефатально:
+		# конфиг уже применён выше, а служба и так поднята постинстом). Не
+		# валим весь install ради этого — DoH в любом случае уже настроен.
+		/etc/init.d/https-dns-proxy enable || true
+		/etc/init.d/https-dns-proxy restart || log "предупреждение: https-dns-proxy restart вернул ошибку (гонка с post-install), служба и так должна быть поднята"
+		/etc/init.d/dnsmasq restart || log "предупреждение: dnsmasq restart вернул ошибку, перезапустите вручную при необходимости"
+	else
+		log "предупреждение: https-dns-proxy не встал (см. /tmp/vless-tunnel-doh-install.log," \
+			"возможно конфликт с forkop) — DNS роутера остаётся как есть, можно настроить позже вручную"
+	fi
 else
-	log "предупреждение: https-dns-proxy не встал (см. /tmp/vless-tunnel-doh-install.log," \
-		"возможно конфликт с forkop) — DNS роутера остаётся как есть, можно настроить позже вручную"
+	log "DoH (https-dns-proxy) не ставлю: по умолчанию выключен, включается VLESS_TUNNEL_DOH=1"
 fi
 
 log "готово."

@@ -6,12 +6,12 @@
 # в /usr/bin/vless-tunnel — сюда она не заползает.
 #
 # TPROXY-правила в 10-vless-tunnel.nft перехватывают весь TCP/UDP из LAN
-# безусловно (кроме приватных сетей и bypass) — решение "домен из списка
-# или нет" принимает сам Xray через routing.rules (sniffing SNI/TLS), не
+# безусловно (кроме приватных сетей и bypass) — решение "туннель или
+# напрямую" принимает сам Xray через routing.rules (sniffing SNI/TLS), не
 # nftables. Поэтому здесь больше нет ни dnsmasq-обвязки, ни nft-сетов под
 # domains/subnets — их место занял /usr/bin/vless-tunnel _build-config,
-# который перед каждым стартом вставляет актуальные domains/subnets прямо
-# в config.json.
+# который перед каждым стартом вставляет актуальные domains/subnets (и,
+# в mode=proxy, исключения direct-domains и geoip:ru) прямо в config.json.
 
 USE_PROCD=1
 START=99
@@ -75,15 +75,18 @@ start_service() {
 	"$BIN" _build-config || {
 		echo "vless-tunnel: нет конфига — vless-tunnel set-link \"vless://...\""; return 1; }
 
-	# Конфиг проверяет само ядро — до того, как мы тронем сеть
-	"$XRAY_BIN" run -test -c "$CONFIG_JSON" >/dev/null 2>&1 || {
+	# Конфиг проверяет само ядро — до того, как мы тронем сеть.
+	# XRAY_LOCATION_ASSET обязателен и здесь: в mode=proxy в правилах есть
+	# geoip:ru, а `xray -test` без переменной ищет geoip.dat рядом с бинарником.
+	XRAY_LOCATION_ASSET=/etc/vless-tunnel "$XRAY_BIN" run -test -c "$CONFIG_JSON" >/dev/null 2>&1 || {
 		echo "vless-tunnel: ядро отвергло $CONFIG_JSON"; return 1; }
 
 	procd_open_instance xray
 	procd_set_param command "$XRAY_BIN" run -c "$CONFIG_JSON"
-	# geo-файлы (geosite.dat/geoip.dat) не ставим: список доменов — свой,
-	# вставлен в routing.rules напрямую при сборке config.json
-	procd_set_param env GOMEMLIMIT=48MiB
+	# geoip.dat (нужен только режиму proxy) лежит рядом с config.json;
+	# Xray ищет geo-данные по XRAY_LOCATION_ASSET. geosite.dat не ставим —
+	# домены по-прежнему inline в routing.rules.
+	procd_set_param env GOMEMLIMIT=48MiB XRAY_LOCATION_ASSET=/etc/vless-tunnel
 	procd_set_param respawn 3600 5 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1

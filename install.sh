@@ -28,8 +28,9 @@
 # Ставится в те же системные пути, поэтому активен всегда только один из
 # двух — установка одного варианта аккуратно вытесняет другой.
 #
-# Ставит снэпшот domains/subnets (если их там ещё нет) и по возможности —
-# https-dns-proxy для DoH-резолва самого роутера (см. HANDOFF.md).
+# Ставит снэпшот domains/subnets (если их там ещё нет). DoH
+# (https-dns-proxy) по умолчанию не ставится — только с VLESS_TUNNEL_DOH=1
+# (см. HANDOFF.md, «DNS роутера в сторону апстрима»).
 
 set -e
 
@@ -174,6 +175,26 @@ fi
 
 /etc/init.d/vless-tunnel enable
 
+# --- этап 3.5: flow offloading (несовместим с TPROXY) ----------------------
+#
+# На MT7981 fw4 (или LuCI) может быть включён software/hardware flow
+# offload. Offload уводит установленные потоки мимо netfilter, а значит и
+# мимо TPROXY: часть соединений уходит напрямую, с российским IP, хотя
+# должна была идти в туннель. Симптом — «на компьютере через прокси
+# открывается, а приложение на телефоне говорит, что страна не
+# поддерживается»: часть его соединений offload'ится и выходит напрямую.
+# Для sniffing-варианта (TPROXY на весь LAN) offload всё равно бесполезен,
+# выключаем оба вида.
+OFF_SW=$(uci -q get firewall.@defaults[0].flow_offloading || true)
+OFF_HW=$(uci -q get firewall.@defaults[0].flow_offloading_hw || true)
+if [ "$OFF_SW" = "1" ] || [ "$OFF_HW" = "1" ]; then
+	log "отключаю flow offloading (TPROXY с ним несовместим)"
+	uci set firewall.@defaults[0].flow_offloading='0'
+	uci set firewall.@defaults[0].flow_offloading_hw='0'
+	uci commit firewall
+	fw4 reload || /etc/init.d/firewall restart || true
+fi
+
 # --- этап 4: nftables-правила без fw4 reload -------------------------------
 #
 # fw4 инклюдит /etc/nftables.d/*.nft сам при следующем reload/restart сети/
@@ -233,28 +254,36 @@ fi
 # apk объявляет `breaks` между ними, и оба сразу стоять не могут), не
 # валим всю установку, просто предупреждаем — см. HANDOFF.md, "DNS
 # роутера в сторону апстрима".
-if apk info -e https-dns-proxy >/dev/null 2>&1; then
-	log "https-dns-proxy уже установлен — не трогаю"
-elif apk add https-dns-proxy >/tmp/vless-tunnel-doh-install.log 2>&1; then
-	log "https-dns-proxy установлен — настраиваю (Cloudflare, без force_dns)"
-	uci -q delete https-dns-proxy.@https-dns-proxy[1] || true
-	uci set https-dns-proxy.config.force_dns='0'
-	uci commit https-dns-proxy
-	uci -q del_list dhcp.@dnsmasq[0].server='127.0.0.1#5054' || true
-	uci -q del_list dhcp.@dnsmasq[0].doh_server='127.0.0.1#5054' || true
-	uci -q del_list dhcp.@dnsmasq[0].doh_backup_server='127.0.0.1#5054' || true
-	uci commit dhcp
-	# apk add у https-dns-proxy сам стартует службу через post-install —
-	# следующие restart иногда ловят гонку за procd-локом с этим уже
-	# идущим стартом и возвращают ошибку (не зависают, но нефатально:
-	# конфиг уже применён выше, а служба и так поднята постинстом). Не
-	# валим весь install ради этого — DoH в любом случае уже настроен.
-	/etc/init.d/https-dns-proxy enable || true
-	/etc/init.d/https-dns-proxy restart || log "предупреждение: https-dns-proxy restart вернул ошибку (гонка с post-install), служба и так должна быть поднята"
-	/etc/init.d/dnsmasq restart || log "предупреждение: dnsmasq restart вернул ошибку, перезапустите вручную при необходимости"
+# DoH теперь opt-in: глобальный https-dns-proxy периодически ломал резолв
+# (в РФ его режут/троттлят, а Cloudflare без ECS отдаёт не те CDN-плечи),
+# а для этой архитектуры он и не нужен — SNI всё равно виден провайдеру,
+# см. README. Включается явно: VLESS_TUNNEL_DOH=1 sh install.sh
+if [ "${VLESS_TUNNEL_DOH:-0}" = "1" ]; then
+	if apk info -e https-dns-proxy >/dev/null 2>&1; then
+		log "https-dns-proxy уже установлен — не трогаю"
+	elif apk add https-dns-proxy >/tmp/vless-tunnel-doh-install.log 2>&1; then
+		log "https-dns-proxy установлен — настраиваю (Cloudflare, без force_dns)"
+		uci -q delete https-dns-proxy.@https-dns-proxy[1] || true
+		uci set https-dns-proxy.config.force_dns='0'
+		uci commit https-dns-proxy
+		uci -q del_list dhcp.@dnsmasq[0].server='127.0.0.1#5054' || true
+		uci -q del_list dhcp.@dnsmasq[0].doh_server='127.0.0.1#5054' || true
+		uci -q del_list dhcp.@dnsmasq[0].doh_backup_server='127.0.0.1#5054' || true
+		uci commit dhcp
+		# apk add у https-dns-proxy сам стартует службу через post-install —
+		# следующие restart иногда ловят гонку за procd-локом с этим уже
+		# идущим стартом и возвращают ошибку (не зависают, но нефатально:
+		# конфиг уже применён выше, а служба и так поднята постинстом). Не
+		# валим весь install ради этого — DoH в любом случае уже настроен.
+		/etc/init.d/https-dns-proxy enable || true
+		/etc/init.d/https-dns-proxy restart || log "предупреждение: https-dns-proxy restart вернул ошибку (гонка с post-install), служба и так должна быть поднята"
+		/etc/init.d/dnsmasq restart || log "предупреждение: dnsmasq restart вернул ошибку, перезапустите вручную при необходимости"
+	else
+		log "предупреждение: https-dns-proxy не встал (см. /tmp/vless-tunnel-doh-install.log," \
+			"возможно конфликт с forkop) — DNS роутера остаётся как есть, можно настроить позже вручную"
+	fi
 else
-	log "предупреждение: https-dns-proxy не встал (см. /tmp/vless-tunnel-doh-install.log," \
-		"возможно конфликт с forkop) — DNS роутера остаётся как есть, можно настроить позже вручную"
+	log "DoH (https-dns-proxy) не ставлю: по умолчанию выключен, включается VLESS_TUNNEL_DOH=1"
 fi
 
 log "готово."

@@ -4,10 +4,11 @@
 // Разбор vless:// перенесён с Python (github.com/RamDll/vless-tunnel,
 // vless-tunnel.sh) на ucode. Архитектура: TPROXY в nftables перехватывает
 // ВЕСЬ TCP/UDP из LAN (кроме приватных сетей и ручного bypass), а решение
-// "домен из списка или нет" принимает сам Xray через sniffing SNI/TLS —
-// не через DNS. Список доменов (domains) и ручной IP-список (subnets)
-// вставляются прямо в routing.rules конфига как inline-списки, без
-// geosite.dat. См. HANDOFF.md, "Архитектурные решения", ревизия п.3.
+// "туннель или напрямую" принимает Xray через sniffing SNI/TLS — не через
+// DNS. Два режима: whitelist (в туннель только domains/subnets) и proxy
+// (в туннель весь веб, кроме RU-доменов/адресов и direct-domains; для
+// последнего нужен geoip.dat, geosite.dat не используется).
+// См. HANDOFF.md, "Архитектурные решения" и "Режим proxy".
 
 import * as fs from 'fs';
 import * as uci from 'uci';
@@ -17,10 +18,21 @@ const CONFIG_DIR = '/etc/vless-tunnel';
 const CONFIG_JSON = CONFIG_DIR + '/config.json';
 const DOMAINS_DEFAULT = CONFIG_DIR + '/domains';
 const SUBNETS_DEFAULT = CONFIG_DIR + '/subnets';
+const DIRECT_DOMAINS_DEFAULT = CONFIG_DIR + '/direct-domains';
+const GEOIP_DEFAULT = CONFIG_DIR + '/geoip.dat';
+// Полный GeoIP (все страны) с кодом `ru`: в режиме proxy по нему отделяется
+// «своё» (напрямую) от «зарубежного» (в туннель). Обновляется командой
+// update-geo, а не при каждой установке.
+const GEOIP_URL = 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat';
 const SELF_BIN = '/usr/bin/vless-tunnel';
 const INIT_SCRIPT = '/etc/init.d/vless-tunnel';
 const NFT_FILE = '/etc/nftables.d/10-vless-tunnel.nft';
 const XRAY_BIN = '/usr/bin/xray';
+// geoip.dat (mode=proxy) Xray ищет по XRAY_LOCATION_ASSET. Служба получает
+// переменную из init-скрипта, но все проверочные запуски (`xray -test`,
+// тестовый конфиг) идут из CLI — им её нужно подставлять явно, иначе
+// `geoip:ru` валится с "failed to open /usr/bin/geoip.dat".
+const XRAY_ENV = 'XRAY_LOCATION_ASSET=' + CONFIG_DIR + ' ';
 const TEST_PORT = 18080;
 const TEST_TARGET = '1.1.1.1';
 
@@ -406,14 +418,57 @@ function build_config(p, o) {
 
 	let domainRules = [];
 	for (let d in (o.domains || [])) push(domainRules, 'domain:' + d);
+	let directRules = [];
+	for (let d in (o.direct_domains || [])) push(directRules, 'domain:' + d);
 	let ipRules = o.subnets || [];
 
 	let rules = [];
-	if (length(domainRules)) push(rules, { type: 'field', domain: domainRules, outboundTag: 'proxy' });
-	if (length(ipRules)) push(rules, { type: 'field', ip: ipRules, outboundTag: 'proxy' });
+	// Явные исключения «всегда напрямую» — раньше остальных правил.
+	// Сюда попадает то, что должно идти мимо туннеля даже при mode=proxy:
+	// банки/госуслуги, сервисы с капчей на датацентровый IP, большие CDN,
+	// которым важна скорость. Приоритет выше «всегда в туннель» (domains),
+	// чтобы исключение можно было поставить, не вычищая домен из domains.
+	if (length(directRules))
+		push(rules, { type: 'field', domain: directRules, outboundTag: 'direct' });
+
+	if (o.mode == 'proxy') {
+		// Режим «в туннель всё, что не RU и не исключение». Новые
+		// заблокированные сайты (xda, aethus, что угодно ещё) не нужно
+		// вписывать руками — они зарубежные и потому идут в proxy.
+		if (length(domainRules))
+			push(rules, { type: 'field', domain: domainRules, outboundTag: 'proxy' });
+		if (length(ipRules))
+			push(rules, { type: 'field', ip: ipRules, outboundTag: 'proxy' });
+
+		// RU-домены и RU-адреса — напрямую: банки/госуслуги не любят
+		// зарубежные IP, а прямой путь ещё и быстрее (нет userspace).
+		push(rules, { type: 'field',
+			domain: ['domain:ru', 'domain:su', 'domain:xn--p1ai'],
+			outboundTag: 'direct' });
+		if (o.geoip_ok)
+			push(rules, { type: 'field', ip: ['geoip:ru'], outboundTag: 'direct' });
+
+		// Весь остальной веб — в туннель. Нестандартные порты остаются
+		// direct (торренты, игры, ssh не гоняем через userspace); если
+		// такой сервис заблокирован — его IP добавляется в subnets.
+		push(rules, { type: 'field', network: 'tcp', port: '80,443,8443', outboundTag: 'proxy' });
+		push(rules, { type: 'field', network: 'udp', port: '443', outboundTag: 'proxy' });
+	} else {
+		if (length(domainRules))
+			push(rules, { type: 'field', domain: domainRules, outboundTag: 'proxy' });
+		if (length(ipRules))
+			push(rules, { type: 'field', ip: ipRules, outboundTag: 'proxy' });
+	}
 	push(rules, { type: 'field', network: 'tcp,udp', outboundTag: 'direct' });
 
-	let sniffing = { enabled: true, destOverride: ['http', 'tls', 'quic'], routeOnly: true };
+	// routeOnly=1 по умолчанию. 0 включается вручную (UCI route_only=0),
+	// когда провайдер подменяет DNS-ответы: тогда домен уходит на резолв
+	// серверу. Важная плата: при routeOnly=0 у sniffed-соединений больше
+	// нет IP назначения, и правило geoip:ru не срабатывает — RU-сайты на
+	// .com (vk.com и т.п.) придётся вписать в direct-domains.
+	let route_only = (type(o.route_only) == 'bool') ? o.route_only : true;
+	let sniffing = { enabled: true, destOverride: ['http', 'tls', 'quic'],
+		routeOnly: route_only };
 
 	return {
 		log: { loglevel: o.log_level || 'warning' },
@@ -502,7 +557,16 @@ function cfg_defaults() {
 	return {
 		enabled: '0', link: '', lan: 'br-lan', tproxy_port: '12345',
 		fwmark: '0x1e5', table: '100',
+		// whitelist — в туннель только domains/subnets (обратная
+		// совместимость); proxy — в туннель весь веб, кроме RU и
+		// явных исключений direct-domains.
+		mode: 'whitelist', log_level: 'warning',
+		// route_only: '1' (по умолчанию) — соединяться с IP, который
+		// увидел TPROXY; '0' — отдавать домен на резолв прокси/серверу
+		// (лечит подменённый DNS, но ломает geoip:ru для sniffed-трафика).
+		route_only: '1',
 		domains: DOMAINS_DEFAULT, subnets: SUBNETS_DEFAULT,
+		direct_domains: DIRECT_DOMAINS_DEFAULT, geoip: GEOIP_DEFAULT,
 	};
 }
 
@@ -543,10 +607,15 @@ function cfg_set(kv) {
 function default_opts() {
 	let cfg = cfg_get_all();
 	return {
+		mode: cfg.mode || 'whitelist',
 		tproxy_port: int(cfg.tproxy_port),
-		log_level: 'warning',
+		log_level: cfg.log_level || 'warning',
+		route_only: (cfg.route_only == '0') ? false : (cfg.route_only == '1') ? true : null,
 		domains: read_list(cfg.domains),
+		direct_domains: read_list(cfg.direct_domains),
 		subnets: read_list(cfg.subnets),
+		geoip: cfg.geoip,
+		geoip_ok: !!fs.access(cfg.geoip),
 	};
 }
 
@@ -608,7 +677,7 @@ function cmd_set_link(link) {
 	write_file(tmp, sprintf('%.J\n', cfg));
 
 	if (fs.access(XRAY_BIN)) {
-		let r = run_capture(XRAY_BIN + ' run -test -c ' + tmp);
+		let r = run_capture(XRAY_ENV + XRAY_BIN + ' run -test -c ' + tmp);
 		fs.unlink(tmp);
 		if (r.code != 0) fail('Xray отверг конфигурацию:\n' + r.output);
 	} else {
@@ -652,7 +721,7 @@ function cmd_build_config() {
 	write_file(tmp, built);
 
 	if (fs.access(XRAY_BIN)) {
-		let r = run_capture(XRAY_BIN + ' run -test -c ' + tmp);
+		let r = run_capture(XRAY_ENV + XRAY_BIN + ' run -test -c ' + tmp);
 		fs.unlink(tmp);
 		if (r.code != 0) fail('Xray отверг пересобранную конфигурацию (проверьте domains/subnets):\n' + r.output);
 	} else {
@@ -671,6 +740,11 @@ function cmd_setup(link) {
 		"# поддомены попадают автоматически\n# youtube.com\n");
 	ensure_list_file(SUBNETS_DEFAULT,
 		"# vless-tunnel: подсети для туннеля, один CIDR на строке\n# 203.0.113.0/24\n");
+	ensure_list_file(DIRECT_DOMAINS_DEFAULT,
+		"# vless-tunnel: домены, которые ВСЕГДА напрямую (приоритетнее domains/subnets)\n" +
+		"# один на строке, # — комментарий, поддомены попадают автоматически\n" +
+		"# Например, сюда стоит вписать банк или сервис, который ругается на VPN.\n" +
+		"# example.com\n");
 	print('vless-tunnel: рабочие файлы готовы (' + CONFIG_DIR + ').\n');
 	if (link) {
 		cmd_set_link(link);
@@ -739,7 +813,14 @@ function cmd_status() {
 	}
 
 	let o = default_opts();
-	print('в туннель по домену: ' + length(o.domains) + ', по IP: ' + length(o.subnets) + '\n');
+	print('режим: ' + (o.mode == 'proxy'
+		? 'proxy (весь веб в туннель, кроме RU и direct-domains)'
+		: 'whitelist (в туннель только domains/subnets)') + '\n');
+	print('в туннель по домену: ' + length(o.domains) + ', по IP: ' + length(o.subnets) +
+		', всегда напрямую: ' + length(o.direct_domains) + '\n');
+	if (o.mode == 'proxy' && !o.geoip_ok)
+		print('ВНИМАНИЕ: mode=proxy, но нет ' + o.geoip +
+			' — правило geoip:ru не добавлено, RU-адреса пойдут в туннель; vless-tunnel update-geo\n');
 }
 
 // Проверка связи с сервером в обход nftables/TPROXY: временный http-
@@ -753,13 +834,13 @@ function cmd_test() {
 	let log = '/tmp/vless-tunnel-test.log';
 	write_file(tmp, sprintf('%.J\n', build_test_config(p)));
 
-	let check = run_capture(XRAY_BIN + ' run -test -c ' + tmp);
+	let check = run_capture(XRAY_ENV + XRAY_BIN + ' run -test -c ' + tmp);
 	if (check.code != 0) {
 		fs.unlink(tmp);
 		fail('Xray отверг тестовую конфигурацию:\n' + check.output);
 	}
 
-	let pid = run_background(XRAY_BIN + ' run -c ' + tmp, log);
+	let pid = run_background(XRAY_ENV + XRAY_BIN + ' run -c ' + tmp, log);
 	let ready = false;
 	for (let i = 0; i < 10; i++) {
 		if (port_listening(TEST_PORT)) { ready = true; break; }
@@ -799,7 +880,29 @@ function cmd_doctor() {
 	ok = check('модуль ядра nft_tproxy загружен', mod.code == 0,
 		mod.code == 0 ? null : 'apk add kmod-nft-tproxy kmod-nf-tproxy') && ok;
 
+	// flow offload уводит установленные потоки мимо netfilter/TPROXY:
+	// часть соединений уходит напрямую (с российским IP), хотя должна
+	// быть в туннеле. Именно так «на компьютере работает, а приложение
+	// на телефоне говорит, что страна не поддерживается».
+	let off_sw = trim(run_capture('uci -q get firewall.@defaults[0].flow_offloading').output ?? '');
+	let off_hw = trim(run_capture('uci -q get firewall.@defaults[0].flow_offloading_hw').output ?? '');
+	let offload = off_sw == '1' || off_hw == '1';
+	ok = check('flow offloading выключен (TPROXY с ним несовместим)', !offload,
+		offload ? 'uci set firewall.@defaults[0].flow_offloading=0; uci set firewall.@defaults[0].flow_offloading_hw=0; uci commit firewall; fw4 reload' : null) && ok;
+
 	let cfg = cfg_get_all();
+
+	// Если https-dns-proxy удалили, а в dnsmasq остался server=127.0.0.1#5053
+	// (или #5054) — резолв уходит в мёртвый порт: интернет «моргает»
+	// или не работает вовсе, а виноват не туннель. Проверяем именно
+	// связку «пакета нет, а форвард остался».
+	let doh_installed = run_capture('apk info -e https-dns-proxy >/dev/null 2>&1').code == 0;
+	let stale_doh = run_capture('uci -q show dhcp | grep -E "127\\.0\\.0\\.1#505[34]"').output;
+	if (!doh_installed && length(stale_doh))
+		ok = check('dnsmasq не смотрит в мёртвый DoH-порт', false,
+			'uci del_list dhcp.@dnsmasq[0].server=127.0.0.1#5053 (и #5054), uci commit dhcp, /etc/init.d/dnsmasq restart') && ok;
+	else
+		check('dnsmasq не смотрит в мёртвый DoH-порт', true);
 
 	// nft-файл подставляется из UCI один раз, при установке (см. install*.sh)
 	// — если fwmark/tproxy_port поменяли в UCI без переустановки, здесь это
@@ -825,11 +928,19 @@ function cmd_doctor() {
 		}
 	}
 
+	ok = check('режим: ' + (cfg.mode == 'proxy' ? 'proxy' : 'whitelist'), true) && ok;
+	if (cfg.mode == 'proxy') {
+		let geo = !!fs.access(cfg.geoip);
+		ok = check('geoip.dat на месте (' + cfg.geoip + ')', geo,
+			geo ? null : 'vless-tunnel update-geo') && ok;
+	}
+
 	let o = default_opts();
-	check('доменов в списке: ' + length(o.domains) + ', IP-подсетей: ' + length(o.subnets), true);
+	check('доменов в списке: ' + length(o.domains) + ', IP-подсетей: ' + length(o.subnets) +
+		', всегда напрямую: ' + length(o.direct_domains), true);
 
 	if (fs.access(CONFIG_JSON) && fs.access(XRAY_BIN)) {
-		let r = run_capture(XRAY_BIN + ' run -test -c ' + CONFIG_JSON);
+		let r = run_capture(XRAY_ENV + XRAY_BIN + ' run -test -c ' + CONFIG_JSON);
 		ok = check('текущий config.json проходит проверку ядром', r.code == 0,
 			r.code == 0 ? null : r.output) && ok;
 	}
@@ -901,10 +1012,9 @@ function cmd_domains() {
 	for (let d in read_list(domains_path())) print(d + '\n');
 }
 
-function cmd_add_domain(d) {
+function add_domain_to(path, d) {
 	d = lc(trim(d ?? ''));
 	if (!is_valid_domain_line(d)) fail('некорректный домен: ' + d);
-	let path = domains_path();
 	ensure_dir(CONFIG_DIR);
 	ensure_list_file(path, '');
 	for (let e in read_list(path))
@@ -920,9 +1030,8 @@ function cmd_add_domain(d) {
 // Удаляет только строку с самим доменом (после отсечения комментария) —
 // остальные строки файла, включая заголовки категорий и пустые строки,
 // остаются как есть.
-function cmd_remove_domain(d) {
+function remove_domain_from(path, d) {
 	d = lc(trim(d ?? ''));
-	let path = domains_path();
 	let text = read_file(path) ?? '';
 	let kept = [];
 	let found = false;
@@ -937,6 +1046,30 @@ function cmd_remove_domain(d) {
 	apply_lists_change();
 }
 
+function cmd_add_domain(d) {
+	add_domain_to(domains_path(), d);
+}
+
+function cmd_remove_domain(d) {
+	remove_domain_from(domains_path(), d);
+}
+
+function direct_domains_path() {
+	return cfg_get_all().direct_domains;
+}
+
+function cmd_direct_domains() {
+	for (let d in read_list(direct_domains_path())) print(d + '\n');
+}
+
+function cmd_add_direct(d) {
+	add_domain_to(direct_domains_path(), d);
+}
+
+function cmd_remove_direct(d) {
+	remove_domain_from(direct_domains_path(), d);
+}
+
 // Внутренняя: замена всего файла целиком (для веб-страницы — там
 // редактируется общий textarea, а не одна запись).
 function cmd_set_domains_file(tmp_path) {
@@ -945,6 +1078,78 @@ function cmd_set_domains_file(tmp_path) {
 	ensure_dir(CONFIG_DIR);
 	write_file(domains_path(), text);
 	apply_lists_change();
+}
+
+function cmd_set_direct_file(tmp_path) {
+	let text = read_file(tmp_path);
+	if (text == null) fail('не удалось прочитать ' + tmp_path);
+	ensure_dir(CONFIG_DIR);
+	write_file(direct_domains_path(), text);
+	apply_lists_change();
+}
+
+function cmd_mode(arg) {
+	let cfg = cfg_get_all();
+	if (!arg) {
+		print('режим: ' + (cfg.mode == 'proxy' ? 'proxy' : 'whitelist') + '\n');
+		return;
+	}
+	arg = lc(trim(arg));
+	if (!(arg in {whitelist: 1, proxy: 1}))
+		fail('режим должен быть whitelist или proxy');
+	cfg_set({ mode: arg });
+	print('режим: ' + arg + '\n');
+	apply_lists_change();
+	if (arg == 'proxy' && !fs.access(cfg.geoip))
+		print('geoip.dat ещё нет — выполните vless-tunnel update-geo, иначе RU-адреса пойдут в туннель\n');
+}
+
+// geoip.dat нужен только режиму proxy — там по нему RU-адреса исключаются
+// из туннеля. Файл статический (снимок GeoIP на момент скачивания), поэтому
+// это отдельная команда, а не подписка и не часть каждой установки.
+function cmd_update_geo() {
+	let cfg = cfg_get_all();
+	let tmp = '/tmp/vless-tunnel-geoip.dat';
+	ensure_dir(CONFIG_DIR);
+	print('скачиваю ' + GEOIP_URL + '\n');
+	let r = run_capture('wget -q -T 60 -O ' + tmp + ' "' + GEOIP_URL + '"');
+	if (r.code != 0) fail('не удалось скачать geoip.dat:\n' + r.output);
+	let sz = int(trim(run_capture('wc -c < ' + tmp).output));
+	if (sz < 1000000) {
+		fs.unlink(tmp);
+		fail('скачанный geoip.dat слишком мал (' + sz + ' байт) — не заменяю');
+	}
+
+	let backup = cfg.geoip + '.bak';
+	if (fs.access(cfg.geoip)) system('cp -f ' + cfg.geoip + ' ' + backup);
+	system('cp -f ' + tmp + ' ' + cfg.geoip);
+	system('chmod 0644 ' + cfg.geoip);
+	fs.unlink(tmp);
+	print('файл скачан (' + sz + ' байт), проверяю...\n');
+
+	// `xray -test` не грузит geo-данные, поэтому проверяем по-настоящему:
+	// после замены служба должна подняться и слушать tproxy_port. Если
+	// нет (битый/чужой файл) — возвращаем предыдущий и поднимаемся с ним.
+	if (service_running()) {
+		run_capture(INIT_SCRIPT + ' restart');
+		let up = false;
+		for (let i = 0; i < 10; i++) {
+			if (port_listening(int(cfg.tproxy_port))) { up = true; break; }
+			system('sleep 1');
+		}
+		if (!up) {
+			if (fs.access(backup)) {
+				system('cp -f ' + backup + ' ' + cfg.geoip);
+			} else {
+				// Бэкапа не было (первое обновление) — возвращаемся к
+				// состоянию «geoip нет», а не оставляем заведомо битый файл.
+				fs.unlink(cfg.geoip);
+			}
+			run_capture(INIT_SCRIPT + ' restart');
+			fail('ядро не поднялось с новым geoip.dat — предыдущее состояние восстановлено');
+		}
+	}
+	print('geoip.dat обновлён\n');
 }
 
 // Снимает только то, что сами же добавили в живой ruleset — целенаправленно
@@ -984,8 +1189,14 @@ function usage_text() {
 		'  test                  проверить связь с сервером в обход nftables\n' +
 		'  doctor                диагностика окружения\n' +
 		'  domains               вывести текущий список доменов\n' +
-		'  add-domain <домен>    добавить домен в список\n' +
-		'  remove-domain <домен> убрать домен из списка\n' +
+		'  add-domain <домен>    добавить домен в список (в туннель)\n' +
+		'  remove-domain <домен> убрать домен из списка (в туннель)\n' +
+		'  direct-domains        домены, которые всегда напрямую\n' +
+		'  add-direct <домен>    добавить домен в исключения (всегда напрямую)\n' +
+		'  remove-direct <домен> убрать домен из исключений\n' +
+		'  mode [proxy|whitelist] режим: proxy — весь веб в туннель кроме RU,\n' +
+		'                        whitelist — только domains/subnets\n' +
+		'  update-geo            скачать/обновить geoip.dat (нужен для mode=proxy)\n' +
 		'  uninstall             удалить конфигурацию и правила\n' +
 		'  help                  показать эту справку\n' +
 		'  parse <ссылка>        разобрать ссылку и напечатать разбор (отладка)\n' +
@@ -1039,9 +1250,24 @@ try {
 	} else if (cmd == 'remove-domain') {
 		if (length(args) < 2) usage();
 		cmd_remove_domain(args[1]);
+	} else if (cmd == 'direct-domains') {
+		cmd_direct_domains();
+	} else if (cmd == 'add-direct') {
+		if (length(args) < 2) usage();
+		cmd_add_direct(args[1]);
+	} else if (cmd == 'remove-direct') {
+		if (length(args) < 2) usage();
+		cmd_remove_direct(args[1]);
+	} else if (cmd == 'mode') {
+		cmd_mode(args[1]);
+	} else if (cmd == 'update-geo') {
+		cmd_update_geo();
 	} else if (cmd == '_set-domains-file') {
 		if (length(args) < 2) usage();
 		cmd_set_domains_file(args[1]);
+	} else if (cmd == '_set-direct-file') {
+		if (length(args) < 2) usage();
+		cmd_set_direct_file(args[1]);
 	} else if (cmd == 'help' || cmd == '-h' || cmd == '--help') {
 		cmd_help();
 	} else {
