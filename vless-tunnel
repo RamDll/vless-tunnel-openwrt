@@ -56,6 +56,15 @@ const METRICS_ADDR = '127.0.0.1:11180';
 // ответил — сервер считается мёртвым, и балансер отдаёт трафик в direct.
 const PROBE_URL = 'https://www.gstatic.com/generate_204';
 const PROBE_INTERVAL = '30s';
+// TCP_USER_TIMEOUT для соединений к серверу: сколько отправленные данные
+// могут оставаться неподтверждёнными, прежде чем ядро закроет соединение.
+// На пути «дом ↔ VPS» бывает, что TCP-рукопожатие проходит, а ClientHello
+// REALITY выбрасывается (26.10: 32 соединения разом, ClientHello без ACK).
+// Без тайм-аута ядро переотправляет его ~15 минут (tcp_retries2=15), а
+// x/net/http2 ждёт рукопожатия без срока — и все потоки LAN, ждущие это
+// соединение, висят столько же, держа память. С тайм-аутом соединение
+// умирает за секунды, и Xray открывает новое.
+const TCP_USER_TIMEOUT_MS = 10000;
 // IP самого сервера туннеля для сетов vless4_server/vless6_server — пишется
 // при каждой пересборке config.json (см. sync_server_bypass). Имя
 // сортируется после NFT_FILE: fw4 инклюдит /etc/nftables.d/*.nft по
@@ -372,6 +381,10 @@ function build_stream(p) {
 	} else {
 		st.security = 'none';
 	}
+
+	// quic и kcp идут поверх UDP — TCP-опция им ни к чему.
+	if (!(net in { quic: 1, kcp: 1 }))
+		st.sockopt = { tcpUserTimeout: TCP_USER_TIMEOUT_MS };
 	return st;
 }
 
