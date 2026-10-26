@@ -105,7 +105,15 @@ start_service() {
 	# geoip.dat (нужен только режиму proxy) лежит рядом с config.json;
 	# Xray ищет geo-данные по XRAY_LOCATION_ASSET. geosite.dat не ставим —
 	# домены по-прежнему inline в routing.rules.
-	procd_set_param env GOMEMLIMIT=48MiB XRAY_LOCATION_ASSET=/etc/vless-tunnel
+	#
+	# GOMEMLIMIT — мягкая цель для сборщика мусора Go, а не потолок: если
+	# живая куча больше неё, GC крутится непрерывно и съедает до половины
+	# CPU, а память всё равно не освобождается. Было 48MiB — на реальном
+	# роутере в mode=proxy (geoip:ru, ~300 соединений XHTTP к серверу) RSS
+	# Xray 85–89 МБ, и без трафика он держал ~1,2 ядра из двух; под
+	# YouTube роутер упирался в CPU на ~20 Мбит/с (26.10.2026). 96MiB —
+	# с запасом над этим, но в пределах свободной памяти WR3000S.
+	procd_set_param env GOMEMLIMIT=96MiB XRAY_LOCATION_ASSET=/etc/vless-tunnel
 	procd_set_param respawn 3600 5 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1
