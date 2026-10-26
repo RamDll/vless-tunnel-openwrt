@@ -13,10 +13,21 @@
   недоступен → напрямую», полное удаление `vless-tunnel uninstall
   [--purge]`, безопасная замена dnsmasq на dnsmasq-full. Всё проверено на
   Docker-стенде — см. «26.10.2026: три режима, DNS через туннель,
-  fallback». **На реальный роутер новая версия ещё не ставилась.**
+  fallback». На роутер поставлена 26.10 (см. ниже).
 - **Роутер `192.168.1.1`**: OpenWrt 25.12.6 r33311, WAN — PPPoE, flow
-  offloading выключен. С вечера 25.10 стоит прежняя версия из `main`
-  (коммит aaa54f0) в режиме `whitelist`, `doctor` зелёный. Найдено 26.10:
+  offloading выключен. **С 26.10 13:33 МСК стоит новая версия (коммит
+  4f0efba) в режиме `proxy`**: поставлена `sh install.sh proxy` из
+  `local-deploy` (geoip.dat скопирован заранее), под deadman-откатом.
+  `doctor` — всё зелёное; instagram.com / www.facebook.com через dnsmasq
+  резолвятся в настоящие адреса; с LAN-клиента example.com, xda, Instagram,
+  YouTube, GitHub, anthropic.com, claude.ai → `proxy` (внешний IP — VPS),
+  ya.ru, vk.com, gosuslugi, sberbank → `direct`, DNS списка → `dns-proxy`.
+  Xray RSS 45 МБ, доступно ~92 МБ. Бэкап прежнего состояния (whitelist,
+  aaa54f0): `/root/vt-backup.tgz` на роутере и
+  `~/router-backups/vt-before-proxy-20261026.tgz`; откат —
+  `/root/vt-rollback.sh` (без аргумента — сразу). На роутере нет `nohup`:
+  фоновые задачи — через `setsid … </dev/null >/dev/null 2>&1 &`.
+  Найдено 26.10:
   **DNS провайдера (Ростелеком, 78.37.77.77 / 212.48.197.77) отдаёт
   `127.0.0.1` на instagram.com, www.instagram.com, i./graph.instagram.com,
   facebook.com, www.facebook.com, static.xx.fbcdn.net** (dnsmasq роутера
@@ -52,10 +63,10 @@
   сервере выключены (`access.log`/`error.log` пустые). В `mode proxy` связь
   с домашнего IP один раз пропадала — это путь «дом ↔ VPS», не перегрузка
   (см. «Инцидент 25.10.2026»); от этого теперь страхует fallback.
-- **Следующий шаг**: поставить новую версию на роутер с планом отката
-  (сначала обновление поверх — `sh install.sh` без режима оставит
-  `whitelist`), проверить Instagram с телефона по Wi-Fi без VPN, `doctor`,
-  fallback; затем `sh install.sh proxy`. Ссылка сервера в репозитории не
+- **Следующий шаг**: владельцу — проверить Instagram/Facebook с телефона
+  по Wi-Fi без VPN; понаблюдать, не повторится ли обрыв пути «дом ↔ VPS»
+  под нагрузкой `proxy` (теперь при этом должен сработать fallback —
+  `vless-tunnel status`, строка «туннель:»). Ссылка сервера в репозитории не
   хранится (секция `forkop` в бэкапе
   `~/router-backups/backup-cudy-20260910-2103.tar.gz`).
 
