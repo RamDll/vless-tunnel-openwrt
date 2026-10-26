@@ -2,57 +2,72 @@
 # install.sh — установка vless-tunnel на OpenWrt
 #
 # Использование:
-#   sh install.sh                  установить, ссылку сервера задать потом
-#   sh install.sh "vless://..."    установить и сразу задать ссылку
+#   sh install.sh [whitelist|proxy|dns] ["vless://..."]
 #
-# Ищет рядом с собой файлы проекта (vless-tunnel, vless-tunnel.init,
-# vless-tunnel.config, 10-vless-tunnel.nft, vless-tunnel-web). Если их
-# нет — скачивает с
-# $VLESS_TUNNEL_BASE_URL вместе с sha256sums и проверяет суммы, прежде
-# чем что-либо трогать на диске (см. HANDOFF.md, архитектурное решение 4:
+#   whitelist — в туннель только domains/subnets (по умолчанию при первой
+#               установке); решение принимает Xray по TLS SNI/HTTP Host
+#   proxy     — в туннель весь веб, кроме RU-доменов/адресов и
+#               direct-domains; заодно скачивает geoip.dat (~16 МБ)
+#   dns       — в туннель domains/subnets, решение по DNS в nftables;
+#               ставит dnsmasq-full (обычный собран без nftset)
+#
+# Без режима повторный запуск (обновление) оставляет режим прежним. Ссылку
+# можно передать и единственным аргументом, как раньше: sh install.sh "vless://..."
+# Удаление: vless-tunnel uninstall [--purge]
+#
+# Ищет рядом с собой файлы проекта (см. FILES). Если их нет — скачивает с
+# $VLESS_TUNNEL_BASE_URL вместе с sha256sums и проверяет суммы, прежде чем
+# что-либо трогать на диске (см. HANDOFF.md, архитектурное решение 4:
 # распространение — установочный скрипт, не .apk).
 #
 # Ничего не переустанавливает вслепую при повторном запуске: пакеты через
-# apk идемпотентны, свои nftables chain/set пересобираются без задвоения
-# правил (nft list добавляет правила в chain заново при каждом nft -f —
-# поэтому chain удаляется и создаётся заново, а не просто дополняется),
-# существующий /etc/config/vless-tunnel не трогается.
+# apk идемпотентны, nft-правила собирает `vless-tunnel _apply-nft` одной
+# транзакцией (destroy + объявление заново, без задвоения правил),
+# существующие /etc/config/vless-tunnel и списки не трогаются.
 #
-# dnsmasq-full НЕ ставим и не трогаем: домен из списка распознаётся
-# sniffing'ом внутри Xray (TLS SNI/HTTP Host самого соединения), а не по
-# DNS-ответу — dnsmasq тут больше ни при чём.
-#
-# Есть независимый альтернативный установщик — install-dns.sh (архитектура
-# «решение в nftables по DNS-наблюдению», offload лучше, но уязвима к
-# DNS-over-HTTPS на клиенте — см. HANDOFF.md, «Эволюция архитектуры»).
-# Ставится в те же системные пути, поэтому активен всегда только один из
-# двух — установка одного варианта аккуратно вытесняет другой.
-#
-# Ставит снэпшот domains/subnets (если их там ещё нет). DoH
-# (https-dns-proxy) по умолчанию не ставится — только с VLESS_TUNNEL_DOH=1
+# DoH (https-dns-proxy) по умолчанию не ставится — только с VLESS_TUNNEL_DOH=1
 # (см. HANDOFF.md, «DNS роутера в сторону апстрима»).
 
 set -e
 
-FILES="vless-tunnel vless-tunnel.init vless-tunnel.config 10-vless-tunnel.nft vless-tunnel-web vless-tunnel-redirect.html domains subnets"
+FILES="vless-tunnel vless-tunnel.init vless-tunnel.config 10-vless-tunnel.nft 10-vless-tunnel-dns.nft vless-tunnel-web vless-tunnel-redirect.html domains subnets"
 WORK_DIR="/tmp/vless-tunnel-install.$$"
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SHARE_DIR=/usr/share/vless-tunnel
 
 log()  { echo "vless-tunnel install: $*"; }
 die()  { echo "vless-tunnel install: ошибка: $*" >&2; exit 1; }
-cleanup() { rm -rf "$WORK_DIR"; }
+# Если установка оборвалась посреди замены dnsmasq — вернуть резолвер.
+cleanup() {
+	[ -f "$WORK_DIR/resolv.conf" ] && cat "$WORK_DIR/resolv.conf" > /etc/resolv.conf
+	rm -rf "$WORK_DIR"
+}
 trap cleanup EXIT
+
+VARIANT=
+case "$1" in
+	whitelist|proxy|dns) VARIANT=$1; shift ;;
+esac
+LINK=$1
 
 [ "$(id -u)" = "0" ] || die "нужен root"
 command -v apk   >/dev/null 2>&1 || die "нужен apk — установщик не для opkg-роутеров"
 command -v fw4   >/dev/null 2>&1 || die "нужен fw4 (firewall4)"
 command -v ucode >/dev/null 2>&1 || die "нужен ucode"
 
+if [ -z "$VARIANT" ]; then
+	VARIANT=$(uci -q get vless-tunnel.main.mode || true)
+	# Прежний install-dns.sh режим в UCI не писал — узнаём его по nft-файлу.
+	[ -z "$VARIANT" ] && grep -q vless4_dns /etc/nftables.d/10-vless-tunnel.nft 2>/dev/null && VARIANT=dns
+	case "$VARIANT" in whitelist|proxy|dns) : ;; *) VARIANT=whitelist ;; esac
+fi
+log "режим: $VARIANT"
+
 if [ -r /etc/openwrt_release ]; then
 	. /etc/openwrt_release
-	case "$OPENWRT_ARCH" in
+	case "$DISTRIB_ARCH" in
 		aarch64*) : ;;
-		*) log "предупреждение: собрано и проверено на aarch64_cortex-a53, здесь $OPENWRT_ARCH" ;;
+		*) log "предупреждение: собрано и проверено на aarch64_cortex-a53, здесь ${DISTRIB_ARCH:-неизвестно}" ;;
 	esac
 fi
 
@@ -109,20 +124,45 @@ else
 	apk add kmod-nft-tproxy kmod-nf-tproxy || die "не удалось установить kmod-nft-tproxy/kmod-nf-tproxy"
 fi
 
-# dnsmasq-full/confdir раньше требовались — решение "туннель или
-# напрямую" принималось по членству IP в nftables-сете, который заполнял
-# dnsmasq через директиву nftset= при резолве. С переходом на sniffing
-# внутри Xray (домен берётся из TLS SNI/HTTP Host самого соединения, а не
-# из DNS-ответа) это больше не нужно — dnsmasq не трогаем вовсе.
+# Режиму dns нужен dnsmasq-full: домены тегируются в nftables-сет
+# директивой nftset=, а штатный dnsmasq на OpenWrt собран без неё.
+#
+# Замена опасна: apk сначала удаляет dnsmasq и только потом качает
+# остальное, а резолвер самого роутера (/etc/resolv.conf → 127.0.0.1) — это
+# и есть dnsmasq. Скачивание падало, и роутер оставался без DNS и DHCP на
+# весь LAN (воспроизведено на стенде). Поэтому: --cache-predownload качает
+# все пакеты ДО начала транзакции, а на время замены роутер резолвит
+# напрямую через DNS провайдера. Если dnsmasq после этого всё-таки нет —
+# ставим обратно обычный, пока резолвер ещё прямой.
+need_dnsmasq_full() {
+	DM_VER=$(dnsmasq --version 2>&1 || true)
+	echo "$DM_VER" | grep -q 'no-nftset' && return 0
+	echo "$DM_VER" | grep -q ' nftset' && return 1
+	return 0
+}
 
-# Если рядом остались следы старой (dnsmasq-based) установки — подчистим,
-# иначе dnsmasq будет пытаться писать в сеты, которых больше нет. Сами
-# сеты vless4/vless4_dns удаляются позже (этап 4), после того как старая
-# chain, которая на них ссылается, будет снесена и пересоздана.
-if [ -f /tmp/dnsmasq.d/vless-tunnel.conf ]; then
-	log "убираю остаток старой установки (nftset в dnsmasq больше не нужен)"
-	rm -f /tmp/dnsmasq.d/vless-tunnel.conf
+swap_dnsmasq() {
+	log "меняю dnsmasq на dnsmasq-full — DNS и DHCP пропадут на несколько секунд"
+	cat /etc/resolv.conf > "$WORK_DIR/resolv.conf"
+	{ grep '^nameserver' /tmp/resolv.conf.d/resolv.conf.auto 2>/dev/null || echo 'nameserver 1.1.1.1'; } > /etc/resolv.conf
+	mkdir -p "$WORK_DIR/apk-cache"
+	rc=0
+	apk add --cache-dir "$WORK_DIR/apk-cache" --cache-predownload dnsmasq-full || rc=$?
+	if ! command -v dnsmasq >/dev/null 2>&1; then
+		log "dnsmasq пропал — возвращаю обычный"
+		apk add dnsmasq || true
+	fi
+	cat "$WORK_DIR/resolv.conf" > /etc/resolv.conf
+	rm -f "$WORK_DIR/resolv.conf"
+	/etc/init.d/dnsmasq enable >/dev/null 2>&1 || true
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+	[ "$rc" = "0" ] || die "не удалось установить dnsmasq-full (DNS роутера восстановлен)"
+	need_dnsmasq_full && die "dnsmasq-full установлен, но dnsmasq по-прежнему без nftset"
+	log "dnsmasq-full установлен"
+}
+
+if [ "$VARIANT" = "dns" ]; then
+	if need_dnsmasq_full; then swap_dnsmasq; else log "dnsmasq уже с поддержкой nftset"; fi
 fi
 
 # --- этап 3: файлы проекта -------------------------------------------------
@@ -132,22 +172,17 @@ cp "$WORK_DIR/vless-tunnel.init" /etc/init.d/vless-tunnel
 chmod 0755 /etc/init.d/vless-tunnel
 cp "$WORK_DIR/vless-tunnel" /usr/bin/vless-tunnel
 chmod 0755 /usr/bin/vless-tunnel
+# Шаблоны nft-правил обоих семейств: из них `vless-tunnel _apply-nft`
+# собирает /etc/nftables.d/10-vless-tunnel.nft под текущий режим — и
+# здесь, и при `vless-tunnel mode`.
+mkdir -p "$SHARE_DIR"
+cp "$WORK_DIR/10-vless-tunnel.nft" "$WORK_DIR/10-vless-tunnel-dns.nft" "$SHARE_DIR/"
 
 if [ -f /etc/config/vless-tunnel ]; then
 	log "/etc/config/vless-tunnel уже существует — не трогаю"
 else
 	cp "$WORK_DIR/vless-tunnel.config" /etc/config/vless-tunnel
 fi
-
-# nft-файл — шаблон: __LAN_IFACE__/__FWMARK__/__TPROXY_PORT__ подставляются
-# из UCI (те же значения, что читает vless-tunnel.init для `ip rule` и сам
-# Xray для listen-порта) — иначе при смене этих настроек nft-правила молча
-# расходятся с тем, что реально слушает/маркирует остальная система.
-LAN_IFACE=$(uci -q get vless-tunnel.main.lan || true); LAN_IFACE=${LAN_IFACE:-br-lan}
-FWMARK=$(uci -q get vless-tunnel.main.fwmark || true); FWMARK=${FWMARK:-0x1e5}
-TPROXY_PORT=$(uci -q get vless-tunnel.main.tproxy_port || true); TPROXY_PORT=${TPROXY_PORT:-12345}
-sed -e "s/__LAN_IFACE__/$LAN_IFACE/g" -e "s/__FWMARK__/$FWMARK/g" -e "s/__TPROXY_PORT__/$TPROXY_PORT/g" \
-	"$WORK_DIR/10-vless-tunnel.nft" > /etc/nftables.d/10-vless-tunnel.nft
 
 # Снэпшот доменов/подсетей (itdoginfo/allow-domains на момент сборки
 # этого install.sh) — тоже не трогаем, если список уже свой, набранный
@@ -175,6 +210,12 @@ fi
 
 /etc/init.d/vless-tunnel enable
 
+# setup создаёт секцию main и пустые списки, которых ещё нет; режим —
+# до сборки nft-правил, они от него зависят.
+vless-tunnel setup >/dev/null
+uci set vless-tunnel.main.mode="$VARIANT"
+uci commit vless-tunnel
+
 # --- этап 3.5: flow offloading (несовместим с TPROXY) ----------------------
 #
 # На MT7981 fw4 (или LuCI) может быть включён software/hardware flow
@@ -182,11 +223,15 @@ fi
 # мимо TPROXY: часть соединений уходит напрямую, с российским IP, хотя
 # должна была идти в туннель. Симптом — «на компьютере через прокси
 # открывается, а приложение на телефоне говорит, что страна не
-# поддерживается»: часть его соединений offload'ится и выходит напрямую.
-# Для sniffing-варианта (TPROXY на весь LAN) offload всё равно бесполезен,
-# выключаем оба вида.
+# поддерживается». Выключаем оба вида; что было до установки, запоминаем —
+# `vless-tunnel uninstall` вернёт как было.
 OFF_SW=$(uci -q get firewall.@defaults[0].flow_offloading || true)
 OFF_HW=$(uci -q get firewall.@defaults[0].flow_offloading_hw || true)
+if [ -z "$(uci -q get vless-tunnel.main.saved_offload_sw || true)" ]; then
+	uci set vless-tunnel.main.saved_offload_sw="${OFF_SW:-0}"
+	uci set vless-tunnel.main.saved_offload_hw="${OFF_HW:-0}"
+	uci commit vless-tunnel
+fi
 if [ "$OFF_SW" = "1" ] || [ "$OFF_HW" = "1" ]; then
 	log "отключаю flow offloading (TPROXY с ним несовместим)"
 	uci set firewall.@defaults[0].flow_offloading='0'
@@ -198,30 +243,15 @@ fi
 # --- этап 4: nftables-правила без fw4 reload -------------------------------
 #
 # fw4 инклюдит /etc/nftables.d/*.nft сам при следующем reload/restart сети/
-# перезагрузке (архитектурное решение 2) — файл уже на месте и подхватится.
-# Но если на роутере рядом уже крутится другой сервис со своими nft-
-# правилами мимо /etc/nftables.d (как в этом проекте — форк podkop), сам
-# `fw4 reload` для него небезопасен: он пересобирает весь ruleset с нуля.
-# Поэтому включаем правила сразу, но точечно: chain удаляется и создаётся
-# заново (nft иначе продублирует в нём правила при повторном запуске),
-# а не просто накатывается поверх всего живого ruleset.
+# перезагрузке (архитектурное решение 2). Но включаем правила сразу и
+# точечно: если рядом крутится другой сервис со своими nft-правилами мимо
+# /etc/nftables.d, полный `fw4 reload` для него небезопасен.
 
 log "подключаю nftables-правила"
-nft delete chain inet fw4 vless_prerouting 2>/dev/null || true
-nft delete chain inet fw4 vless_prerouting6 2>/dev/null || true
-# Остатки варианта "-dns" (install-dns.sh): сеты можно снести только
-# после того, как ссылавшаяся на них chain уже удалена выше.
-nft delete set inet fw4 vless4 2>/dev/null || true
-nft delete set inet fw4 vless4_dns 2>/dev/null || true
-nft delete set inet fw4 vless6 2>/dev/null || true
-nft delete set inet fw4 vless6_dns 2>/dev/null || true
-{
-	echo 'table inet fw4 {'
-	cat /etc/nftables.d/10-vless-tunnel.nft
-	echo '}'
-} > "$WORK_DIR/wrapped.nft"
-nft -c -f "$WORK_DIR/wrapped.nft" || die "nft-правила не проходят проверку"
-nft -f "$WORK_DIR/wrapped.nft" || die "не удалось применить nft-правила"
+vless-tunnel _apply-nft || die "nft-правила не применились"
+# Служба выключена — DNS-файл прежней версии (у -dns-варианта он
+# оставался в /tmp/dnsmasq.d) убираем сразу; включённую перезапустим ниже.
+[ "$(uci -q get vless-tunnel.main.enabled)" = "1" ] || vless-tunnel _dns-down
 
 # --- этап 5: первичная настройка -------------------------------------------
 #
@@ -229,35 +259,34 @@ nft -f "$WORK_DIR/wrapped.nft" || die "не удалось применить nf
 # "vless://...") не должна ронять всю установку — пакеты и правила уже на
 # месте, дальше просто попросим задать нормальную ссылку отдельной командой.
 
-if ! vless-tunnel setup "$1"; then
+if [ -n "$LINK" ] && ! vless-tunnel set-link "$LINK"; then
 	log "предупреждение: ссылка не распознана, установка продолжается без неё"
 	log "задайте её отдельно: vless-tunnel set-link \"vless://...\""
-	set -- ""
+	LINK=
 fi
 
-# Если служба уже была включена (переустановка/апгрейд) — перезапускаем
-# сразу. Иначе между "новые nft-правила уже перехватывают всё" и
-# "config.json ещё старый" был бы реальный зазор: старый config.json (без
-# routing/direct-фолбэка) под новой blanket-цепочкой отправил бы В ТУННЕЛЬ
-# абсолютно весь трафик, а не только домены из списка.
+if [ "$VARIANT" = "proxy" ] && [ ! -f /etc/vless-tunnel/geoip.dat ]; then
+	log "скачиваю geoip.dat для режима proxy"
+	vless-tunnel update-geo ||
+		log "предупреждение: geoip.dat не скачался — RU-адреса на .com пойдут в туннель; повторите: vless-tunnel update-geo"
+fi
+
+# Если служба уже была включена (переустановка/апгрейд/смена режима) —
+# перезапускаем сразу. Иначе между "новые nft-правила уже перехватывают
+# всё" и "config.json ещё старый" был бы реальный зазор: старый config.json
+# под новой blanket-цепочкой отправил бы В ТУННЕЛЬ абсолютно весь трафик.
 if [ "$(uci -q get vless-tunnel.main.enabled)" = "1" ]; then
 	log "служба была включена — перезапускаю с новым config.json"
 	/etc/init.d/vless-tunnel restart
 fi
 
-# --- этап 6: DoH для DNS самого роутера (по возможности) -------------------
+# --- этап 6: DoH для DNS самого роутера (opt-in) ---------------------------
 #
-# Апстрим-резолв самого роутера (dnsmasq -> провайдерский DNS) переводим
-# на DNS-over-HTTPS через https-dns-proxy — иначе провайдер видит в
-# открытую, какие домены роутер резолвит, даже если итоговый трафик уже
-# в туннеле. Мягко: если пакет не встал (например, конфликт с forkop —
-# apk объявляет `breaks` между ними, и оба сразу стоять не могут), не
-# валим всю установку, просто предупреждаем — см. HANDOFF.md, "DNS
-# роутера в сторону апстрима".
-# DoH теперь opt-in: глобальный https-dns-proxy периодически ломал резолв
-# (в РФ его режут/троттлят, а Cloudflare без ECS отдаёт не те CDN-плечи),
-# а для этой архитектуры он и не нужен — SNI всё равно виден провайдеру,
-# см. README. Включается явно: VLESS_TUNNEL_DOH=1 sh install.sh
+# Апстрим-резолв самого роутера (dnsmasq -> провайдерский DNS) можно
+# перевести на DNS-over-HTTPS через https-dns-proxy. По умолчанию выключено:
+# глобальный DoH периодически ломал резолв (в РФ его режут/троттлят, а
+# Cloudflare без ECS отдаёт не те CDN-плечи), а домены из списка и так
+# резолвятся через туннель. Включается явно: VLESS_TUNNEL_DOH=1 sh install.sh
 if [ "${VLESS_TUNNEL_DOH:-0}" = "1" ]; then
 	if apk info -e https-dns-proxy >/dev/null 2>&1; then
 		log "https-dns-proxy уже установлен — не трогаю"
@@ -273,24 +302,21 @@ if [ "${VLESS_TUNNEL_DOH:-0}" = "1" ]; then
 		# apk add у https-dns-proxy сам стартует службу через post-install —
 		# следующие restart иногда ловят гонку за procd-локом с этим уже
 		# идущим стартом и возвращают ошибку (не зависают, но нефатально:
-		# конфиг уже применён выше, а служба и так поднята постинстом). Не
-		# валим весь install ради этого — DoH в любом случае уже настроен.
+		# конфиг уже применён выше, а служба и так поднята постинстом).
 		/etc/init.d/https-dns-proxy enable || true
 		/etc/init.d/https-dns-proxy restart || log "предупреждение: https-dns-proxy restart вернул ошибку (гонка с post-install), служба и так должна быть поднята"
 		/etc/init.d/dnsmasq restart || log "предупреждение: dnsmasq restart вернул ошибку, перезапустите вручную при необходимости"
 	else
-		log "предупреждение: https-dns-proxy не встал (см. /tmp/vless-tunnel-doh-install.log," \
-			"возможно конфликт с forkop) — DNS роутера остаётся как есть, можно настроить позже вручную"
+		log "предупреждение: https-dns-proxy не встал (см. /tmp/vless-tunnel-doh-install.log) — DNS роутера остаётся как есть"
 	fi
-else
-	log "DoH (https-dns-proxy) не ставлю: по умолчанию выключен, включается VLESS_TUNNEL_DOH=1"
 fi
 
-log "готово."
+log "готово (режим $VARIANT)."
 echo
-if [ -z "$1" ]; then
+if [ -z "$LINK" ] && [ -z "$(uci -q get vless-tunnel.main.link)" ]; then
 	echo "Дальше:  vless-tunnel set-link \"vless://...\""
 fi
 echo "         vless-tunnel test      — проверить связь с сервером"
 echo "         vless-tunnel on        — включить туннель"
 echo "         vless-tunnel doctor    — диагностика окружения"
+echo "Удалить: vless-tunnel uninstall"

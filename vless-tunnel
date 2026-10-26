@@ -2,13 +2,24 @@
 // /usr/bin/vless-tunnel
 //
 // Разбор vless:// перенесён с Python (github.com/RamDll/vless-tunnel,
-// vless-tunnel.sh) на ucode. Архитектура: TPROXY в nftables перехватывает
-// ВЕСЬ TCP/UDP из LAN (кроме приватных сетей, самого сервера туннеля и
-// ручного bypass), а решение "туннель или напрямую" принимает Xray через
-// sniffing SNI/TLS — не через DNS. Два режима: whitelist (в туннель только domains/subnets) и proxy
-// (в туннель весь веб, кроме RU-доменов/адресов и direct-domains; для
-// последнего нужен geoip.dat, geosite.dat не используется).
-// См. HANDOFF.md, "Архитектурные решения" и "Режим proxy".
+// vless-tunnel.sh) на ucode. Три режима (UCI mode):
+//
+//   whitelist, proxy — TPROXY в nftables перехватывает ВЕСЬ TCP/UDP из LAN
+//     (кроме приватных сетей, самого сервера туннеля и ручного bypass), а
+//     решение "туннель или напрямую" принимает Xray через sniffing SNI/TLS —
+//     не через DNS. whitelist: в туннель только domains/subnets; proxy: весь
+//     веб, кроме RU-доменов/адресов и direct-domains (нужен geoip.dat).
+//   dns — решение принимает nftables ДО Xray: в TPROXY попадают только IP из
+//     subnets и адреса, которые dnsmasq (dnsmasq-full, директива nftset=)
+//     положил в сет при резолве домена из domains. Прямой трафик не трогает
+//     userspace, но клиент с DoH в обход роутера мимо списка.
+//
+// Во всех режимах DNS-запросы к доменам из domains dnsmasq отправляет не
+// провайдеру, а через туннель (dns-in в Xray): провайдерский DNS подменяет
+// часть заблокированных доменов (instagram.com → 127.0.0.1), и до роутера
+// такое соединение не доходит вовсе. Если сервер туннеля недоступен,
+// observatory Xray это замечает, и всё, что шло в туннель, идёт напрямую.
+// См. HANDOFF.md, "Архитектурные решения", "Режим proxy", "DNS через туннель".
 
 import * as fs from 'fs';
 import * as uci from 'uci';
@@ -27,6 +38,24 @@ const GEOIP_URL = 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/late
 const SELF_BIN = '/usr/bin/vless-tunnel';
 const INIT_SCRIPT = '/etc/init.d/vless-tunnel';
 const NFT_FILE = '/etc/nftables.d/10-vless-tunnel.nft';
+// Шаблоны nft-файла (sniffing-режимы и режим dns) — install.sh кладёт их
+// сюда, а `_apply-nft` собирает из нужного NFT_FILE с подстановкой UCI.
+const SHARE_DIR = '/usr/share/vless-tunnel';
+const NFT_TEMPLATE = SHARE_DIR + '/10-vless-tunnel.nft';
+const NFT_TEMPLATE_DNS = SHARE_DIR + '/10-vless-tunnel-dns.nft';
+// Файл в conf-dir dnsmasq: server= (DNS доменов из списка — через туннель)
+// и, в режиме dns, nftset=. Каталог свой у каждого экземпляра dnsmasq —
+// см. dnsmasq_confdir().
+const DNSMASQ_FILE = 'vless-tunnel.conf';
+// Сюда писали прежние версии -dns-варианта (с confdir=/tmp/dnsmasq.d в UCI).
+const DNSMASQ_LEGACY = '/tmp/dnsmasq.d/' + DNSMASQ_FILE;
+// expvar Xray: отсюда status/doctor читают, жив ли сервер по мнению
+// observatory (только при fallback=1).
+const METRICS_ADDR = '127.0.0.1:11180';
+// Проба observatory: раз в PROBE_INTERVAL запрос через proxy-outbound; не
+// ответил — сервер считается мёртвым, и балансер отдаёт трафик в direct.
+const PROBE_URL = 'https://www.gstatic.com/generate_204';
+const PROBE_INTERVAL = '30s';
 // IP самого сервера туннеля для сетов vless4_server/vless6_server — пишется
 // при каждой пересборке config.json (см. sync_server_bypass). Имя
 // сортируется после NFT_FILE: fw4 инклюдит /etc/nftables.d/*.nft по
@@ -408,6 +437,9 @@ function read_list(path) {
 // routeOnly:true берёт домен из TLS SNI/HTTP Host самого соединения —
 // не из DNS-ответа, поэтому не зависит от того, как клиент резолвил адрес
 // (в частности, устойчиво к DNS-over-HTTPS в обход роутера — см. HANDOFF).
+//
+// В режиме dns sniffing и доменных правил нет: в TPROXY и так попадает
+// только то, что nftables решил тоннелировать, — всё это идёт в туннель.
 function build_config(p, o) {
 	let flow = effective_flow(p);
 	let user = { id: p.uuid, encryption: p.encryption || 'none' };
@@ -422,6 +454,35 @@ function build_config(p, o) {
 	};
 	let direct_out = { tag: 'direct', protocol: 'freedom', settings: {} };
 
+	// Тот же сервер для DNS-запросов dnsmasq (dns-in), но с XUDP: каждый
+	// запрос уходит с нового порта, то есть это отдельная UDP-сессия, и без
+	// мультиплексирования каждая открывала бы своё соединение до сервера —
+	// на стенде ~340 мс на запрос против ~110 мс с XUDP. concurrency -1: TCP
+	// не мультиплексируется (и так совместимо с flow vision), только UDP.
+	// Тег НЕ должен начинаться с "proxy": selector балансеров и
+	// subjectSelector observatory сравнивают по префиксу, и балансер tunnel
+	// иначе раздавал бы обычный трафик LAN и через этот outbound.
+	let dns_out = null;
+	if (o.tunnel_dns) {
+		dns_out = json(sprintf('%J', proxy_out));
+		dns_out.tag = 'dns-proxy';
+		dns_out.mux = { enabled: true, concurrency: -1, xudpConcurrency: 8 };
+	}
+
+	// «В туннель» при fallback=1 — не сам proxy-outbound, а балансер над
+	// ним с fallbackTag=direct: когда проба observatory через сервер не
+	// проходит (VPS лёг, путь «дом ↔ VPS» режется), балансер отдаёт трафик
+	// напрямую, а не в мёртвый туннель. Иначе в mode=proxy при обрыве у
+	// всей квартиры пропадает весь зарубежный веб (см. HANDOFF, «Инцидент
+	// 25.10.2026»). Сразу после старта, до первой пробы, сервер считается
+	// живым — проверено на стенде.
+	let fallback = o.fallback !== false;
+	let tunnel = (r) => {
+		if (fallback) r.balancerTag = 'tunnel';
+		else r.outboundTag = 'proxy';
+		return r;
+	};
+
 	let domainRules = [];
 	for (let d in (o.domains || [])) push(domainRules, 'domain:' + d);
 	let directRules = [];
@@ -429,50 +490,61 @@ function build_config(p, o) {
 	let ipRules = o.subnets || [];
 
 	let rules = [];
-	// Сервер туннеля — напрямую, первым правилом. Основной обход — в
-	// nftables (vless4_server, трафик до Xray вообще не доходит); это
-	// страховка на случай, если сеты не обновились. Работает только при
-	// routeOnly=1: при 0 у sniffed-соединения вместо IP уже домен.
-	if (length(o.server_ips))
-		push(rules, { type: 'field', ip: o.server_ips, outboundTag: 'direct' });
+	// DNS-запросы dnsmasq к доменам из списка (см. dnsmasq_text) — в туннель.
+	// Свой балансер: если сервер недоступен, такой запрос уходит не на
+	// dns_upstream напрямую, а на DNS провайдера (dns-direct). Прямой запрос
+	// к 1.1.1.1 из дома для части доменов подменяется на пути (youtube.com →
+	// NXDOMAIN, проверено 26.10.2026), а провайдерский резолвер на них
+	// отвечает честно.
+	if (o.tunnel_dns)
+		push(rules, fallback
+			? { type: 'field', inboundTag: ['dns-in'], balancerTag: 'tunnel-dns' }
+			: { type: 'field', inboundTag: ['dns-in'], outboundTag: 'dns-proxy' });
 
-	// Явные исключения «всегда напрямую» — раньше остальных правил.
-	// Сюда попадает то, что должно идти мимо туннеля даже при mode=proxy:
-	// банки/госуслуги, сервисы с капчей на датацентровый IP, большие CDN,
-	// которым важна скорость. Приоритет выше «всегда в туннель» (domains),
-	// чтобы исключение можно было поставить, не вычищая домен из domains.
-	if (length(directRules))
-		push(rules, { type: 'field', domain: directRules, outboundTag: 'direct' });
-
-	if (o.mode == 'proxy') {
-		// Режим «в туннель всё, что не RU и не исключение». Новые
-		// заблокированные сайты (xda, aethus, что угодно ещё) не нужно
-		// вписывать руками — они зарубежные и потому идут в proxy.
-		if (length(domainRules))
-			push(rules, { type: 'field', domain: domainRules, outboundTag: 'proxy' });
-		if (length(ipRules))
-			push(rules, { type: 'field', ip: ipRules, outboundTag: 'proxy' });
-
-		// RU-домены и RU-адреса — напрямую: банки/госуслуги не любят
-		// зарубежные IP, а прямой путь ещё и быстрее (нет userspace).
-		push(rules, { type: 'field',
-			domain: ['domain:ru', 'domain:su', 'domain:xn--p1ai'],
-			outboundTag: 'direct' });
-		if (o.geoip_ok)
-			push(rules, { type: 'field', ip: ['geoip:ru'], outboundTag: 'direct' });
-
-		// Весь остальной веб — в туннель. Нестандартные порты остаются
-		// direct (торренты, игры, ssh не гоняем через туннель); если
-		// такой сервис заблокирован — его IP добавляется в subnets.
-		push(rules, { type: 'field', network: 'tcp', port: '80,443,8443', outboundTag: 'proxy' });
-		push(rules, { type: 'field', network: 'udp', port: '443', outboundTag: 'proxy' });
+	if (o.mode == 'dns') {
+		push(rules, tunnel({ type: 'field', network: 'tcp,udp' }));
 	} else {
+		// Сервер туннеля — напрямую. Основной обход — в nftables
+		// (vless4_server, трафик до Xray вообще не доходит); это страховка
+		// на случай, если сеты не обновились. Работает только при
+		// routeOnly=1: при 0 у sniffed-соединения вместо IP уже домен.
+		if (length(o.server_ips))
+			push(rules, { type: 'field', ip: o.server_ips, outboundTag: 'direct' });
+
+		// Явные исключения «всегда напрямую» — раньше остальных правил.
+		// Сюда попадает то, что должно идти мимо туннеля даже при
+		// mode=proxy: банки/госуслуги, сервисы с капчей на датацентровый IP,
+		// большие CDN, которым важна скорость. Приоритет выше «всегда в
+		// туннель» (domains), чтобы исключение можно было поставить, не
+		// вычищая домен из domains.
+		if (length(directRules))
+			push(rules, { type: 'field', domain: directRules, outboundTag: 'direct' });
+
 		if (length(domainRules))
-			push(rules, { type: 'field', domain: domainRules, outboundTag: 'proxy' });
+			push(rules, tunnel({ type: 'field', domain: domainRules }));
 		if (length(ipRules))
-			push(rules, { type: 'field', ip: ipRules, outboundTag: 'proxy' });
+			push(rules, tunnel({ type: 'field', ip: ipRules }));
+
+		if (o.mode == 'proxy') {
+			// Режим «в туннель всё, что не RU и не исключение». Новые
+			// заблокированные сайты (xda, aethus, что угодно ещё) не нужно
+			// вписывать руками — они зарубежные и потому идут в proxy.
+			// RU-домены и RU-адреса — напрямую: банки/госуслуги не любят
+			// зарубежные IP, а прямой путь ещё и быстрее.
+			push(rules, { type: 'field',
+				domain: ['domain:ru', 'domain:su', 'domain:xn--p1ai'],
+				outboundTag: 'direct' });
+			if (o.geoip_ok)
+				push(rules, { type: 'field', ip: ['geoip:ru'], outboundTag: 'direct' });
+
+			// Весь остальной веб — в туннель. Нестандартные порты остаются
+			// direct (торренты, игры, ssh не гоняем через туннель); если
+			// такой сервис заблокирован — его IP добавляется в subnets.
+			push(rules, tunnel({ type: 'field', network: 'tcp', port: '80,443,8443' }));
+			push(rules, tunnel({ type: 'field', network: 'udp', port: '443' }));
+		}
+		push(rules, { type: 'field', network: 'tcp,udp', outboundTag: 'direct' });
 	}
-	push(rules, { type: 'field', network: 'tcp,udp', outboundTag: 'direct' });
 
 	// routeOnly=1 по умолчанию. 0 включается вручную (UCI route_only=0),
 	// когда провайдер подменяет DNS-ответы: тогда домен уходит на резолв
@@ -490,41 +562,87 @@ function build_config(p, o) {
 	let log = { loglevel: log_level };
 	if (!(log_level in { debug: 1, info: 1 })) log.access = 'none';
 
-	return {
+	let inbounds = [{
+		tag: 'tproxy-in',
+		// TPROXY доставляет пакет "локально" по destination IP клиента,
+		// который почти никогда не равен 127.0.0.1 — сокет обязан
+		// слушать на 0.0.0.0, иначе ядро не находит слушателя.
+		listen: '0.0.0.0',
+		port: o.tproxy_port,
+		protocol: 'dokodemo-door',
+		settings: { network: 'tcp,udp', followRedirect: true },
+		streamSettings: { sockopt: { tproxy: 'tproxy' } },
+	}, {
+		// Зеркало tproxy-in для IPv6 — тот же приём: слушать нужно на
+		// "::" (wildcard), не "::1", иначе TPROXY-доставка по чужому
+		// destination-адресу молча проваливается, ровно как с
+		// 0.0.0.0/127.0.0.1 у v4-инбаунда выше.
+		tag: 'tproxy-in6',
+		listen: '::',
+		port: o.tproxy_port,
+		protocol: 'dokodemo-door',
+		settings: { network: 'tcp,udp', followRedirect: true },
+		streamSettings: { sockopt: { tproxy: 'tproxy' } },
+	}];
+	// routeOnly: домен из sniffing участвует только в выборе outbound'а
+	// (routing.rules выше), а реальное соединение (что в proxy, что в
+	// direct) идёт на исходный IP, который уже увидел TPROXY — без этого
+	// direct-путь потребовал бы своего DNS-резолва внутри Xray, которого мы
+	// сознательно избегаем.
+	if (o.mode != 'dns')
+		for (let ib in inbounds) ib.sniffing = sniffing;
+
+	// Прозрачный форвард на публичный резолвер: dnsmasq шлёт сюда запросы к
+	// доменам из списка (server=/домен/127.0.0.1#dns_port), а routing
+	// отправляет их в туннель — ответ приходит от резолвера с VPS, без
+	// подмены провайдером и с CDN-адресами рядом с сервером, куда этот
+	// трафик потом и пойдёт. userLevel 1: каждый запрос dnsmasq уходит с
+	// нового порта, то есть это отдельная UDP-«сессия» (в XUDP dns-proxy) —
+	// с connIdle по умолчанию (300 с) они копились бы сотнями.
+	if (o.tunnel_dns)
+		push(inbounds, {
+			tag: 'dns-in',
+			listen: '127.0.0.1',
+			port: o.dns_port,
+			protocol: 'dokodemo-door',
+			settings: { address: o.dns_upstream, port: 53, network: 'tcp,udp', userLevel: 1 },
+		});
+
+	let routing = { domainStrategy: 'AsIs', rules: rules };
+	let outbounds = [proxy_out, direct_out];
+	if (dns_out) push(outbounds, dns_out);
+	let cfg = {
 		log: log,
-		inbounds: [{
-			tag: 'tproxy-in',
-			// TPROXY доставляет пакет "локально" по destination IP клиента,
-			// который почти никогда не равен 127.0.0.1 — сокет обязан
-			// слушать на 0.0.0.0, иначе ядро не находит слушателя.
-			listen: '0.0.0.0',
-			port: o.tproxy_port,
-			protocol: 'dokodemo-door',
-			settings: { network: 'tcp,udp', followRedirect: true },
-			streamSettings: { sockopt: { tproxy: 'tproxy' } },
-			// routeOnly: домен из sniffing участвует только в выборе
-			// outbound'а (routing.rules ниже), а реальное соединение (что
-			// в proxy, что в direct) идёт на исходный IP, который уже
-			// увидел TPROXY — без этого direct-путь потребовал бы своего
-			// DNS-резолва внутри Xray, которого мы сознательно избегаем.
-			sniffing: sniffing,
-		}, {
-			// Зеркало tproxy-in для IPv6 — тот же приём: слушать нужно на
-			// "::" (wildcard), не "::1", иначе TPROXY-доставка по чужому
-			// destination-адресу молча проваливается, ровно как с
-			// 0.0.0.0/127.0.0.1 у v4-инбаунда выше.
-			tag: 'tproxy-in6',
-			listen: '::',
-			port: o.tproxy_port,
-			protocol: 'dokodemo-door',
-			settings: { network: 'tcp,udp', followRedirect: true },
-			streamSettings: { sockopt: { tproxy: 'tproxy' } },
-			sniffing: sniffing,
-		}],
-		outbounds: [proxy_out, direct_out],
-		routing: { domainStrategy: 'AsIs', rules: rules },
-		policy: { levels: { '0': { bufferSize: 4 } } },
+		inbounds: inbounds,
+		outbounds: outbounds,
+		routing: routing,
+		policy: { levels: {
+			'0': { bufferSize: 4 },
+			'1': { bufferSize: 4, connIdle: 10, uplinkOnly: 1, downlinkOnly: 1 },
+		} },
 	};
+	if (fallback) {
+		// random с одним кандидатом — то же, что proxy, пока observatory
+		// считает его живым; мёртвый отфильтровывается, и остаётся
+		// fallbackTag. leastPing не подходит: до первой пробы у него нет
+		// данных, и первые секунды после старта всё ушло бы в direct.
+		routing.balancers = [{ tag: 'tunnel', selector: ['proxy'],
+			strategy: { type: 'random' }, fallbackTag: 'direct' }];
+		if (o.tunnel_dns) {
+			push(routing.balancers, { tag: 'tunnel-dns', selector: ['dns-proxy'],
+				strategy: { type: 'random' }, fallbackTag: o.isp_dns ? 'dns-direct' : 'direct' });
+			if (o.isp_dns)
+				push(outbounds, { tag: 'dns-direct', protocol: 'freedom',
+					settings: { redirect: o.isp_dns + ':53' } });
+		}
+		// enableConcurrency: без него observatory проверяет outbound'ы по
+		// одному за интервал — proxy и dns-proxy узнавали бы о падении и
+		// возврате сервера с разницей до минуты (видно на стенде).
+		cfg.observatory = { subjectSelector: dns_out ? ['proxy', 'dns-proxy'] : ['proxy'],
+			probeUrl: PROBE_URL, probeInterval: PROBE_INTERVAL, enableConcurrency: true };
+		cfg.metrics = { tag: 'metrics', listen: METRICS_ADDR };
+	}
+	return cfg;
 }
 
 function summary(p) {
@@ -653,15 +771,28 @@ function cfg_defaults() {
 		fwmark: '0x1e5', table: '100',
 		// whitelist — в туннель только domains/subnets (обратная
 		// совместимость); proxy — в туннель весь веб, кроме RU и
-		// явных исключений direct-domains.
+		// явных исключений direct-domains; dns — решение по DNS в nftables.
 		mode: 'whitelist', log_level: 'warning',
 		// route_only: '1' (по умолчанию) — соединяться с IP, который
 		// увидел TPROXY; '0' — отдавать домен на резолв прокси/серверу
 		// (лечит подменённый DNS, но ломает geoip:ru для sniffed-трафика).
 		route_only: '1',
+		// fallback: '1' — сервер недоступен → туннельный трафик напрямую.
+		fallback: '1',
+		// tunnel_dns: '1' — DNS доменов из domains через туннель, на
+		// dns_upstream (с VPS), через dns-in Xray на 127.0.0.1:dns_port.
+		tunnel_dns: '1', dns_port: '5359', dns_upstream: '1.1.1.1',
 		domains: DOMAINS_DEFAULT, subnets: SUBNETS_DEFAULT,
 		direct_domains: DIRECT_DOMAINS_DEFAULT, geoip: GEOIP_DEFAULT,
 	};
+}
+
+const MODES = { whitelist: 1, proxy: 1, dns: 1 };
+
+function mode_title(mode) {
+	if (mode == 'proxy') return 'proxy (весь веб в туннель, кроме RU и direct-domains)';
+	if (mode == 'dns') return 'dns (в туннель domains/subnets, решение по DNS в nftables)';
+	return 'whitelist (в туннель только domains/subnets)';
 }
 
 function cfg_get_all() {
@@ -698,13 +829,36 @@ function cfg_set(kv) {
 // применяются к routing.rules сразу при следующей пересборке config.json
 // (set-link, on, либо явный _build-config), без отдельной "перезагрузки
 // списков" как раньше у dnsmasq.
+// Первый IPv4-резолвер провайдера (пришёл по DHCP/PPPoE) — на него идут DNS-
+// запросы доменов из списка, пока сервер недоступен (см. dns-direct в
+// build_config). Адрес берётся при сборке config.json; сменится после
+// переподключения WAN — подхватится при следующем старте службы.
+const RESOLV_AUTO = '/tmp/resolv.conf.d/resolv.conf.auto';
+
+function isp_dns() {
+	for (let line in split(read_file(RESOLV_AUTO) ?? '', '\n')) {
+		let m = match(line, /^nameserver[ \t]+([0-9.]+)[ \t]*$/);
+		if (m && is_ipv4(m[1]) && !match(m[1], /^127\./)) return m[1];
+	}
+	return null;
+}
+
 function default_opts() {
 	let cfg = cfg_get_all();
+	let dns_port = int(cfg.dns_port);
 	return {
-		mode: cfg.mode || 'whitelist',
+		mode: (cfg.mode in MODES) ? cfg.mode : 'whitelist',
 		tproxy_port: int(cfg.tproxy_port),
 		log_level: cfg.log_level || 'warning',
 		route_only: (cfg.route_only == '0') ? false : (cfg.route_only == '1') ? true : null,
+		fallback: cfg.fallback != '0',
+		// Битые dns_port/dns_upstream в UCI — DNS через туннель просто
+		// выключается, а не валит сборку config.json.
+		tunnel_dns: cfg.tunnel_dns != '0' && dns_port > 0 && dns_port < 65536 &&
+			is_ip(cfg.dns_upstream),
+		dns_port: dns_port,
+		dns_upstream: cfg.dns_upstream,
+		isp_dns: isp_dns(),
 		domains: read_list(cfg.domains),
 		direct_domains: read_list(cfg.direct_domains),
 		subnets: read_list(cfg.subnets),
@@ -715,6 +869,184 @@ function default_opts() {
 
 function service_running() {
 	return system(INIT_SCRIPT + ' status >/dev/null 2>&1') == 0;
+}
+
+// --- dnsmasq: DNS доменов из списка через туннель, nftset= для mode=dns ----
+// Файл кладётся в conf-dir первого экземпляра dnsmasq и живёт, пока служба
+// работает: _dns-up зовёт init после старта Xray, _dns-down — при остановке.
+// dhcp UCI не трогаем: каталог берём тот же, что выбирает /etc/init.d/dnsmasq
+// (confdir из UCI, иначе /tmp/dnsmasq.<имя секции>.d).
+
+function dnsmasq_confdir() {
+	let dir = null;
+	try {
+		uci.cursor().foreach('dhcp', 'dnsmasq', (s) => {
+			dir = s.confdir ? split(s.confdir, ',')[0] : '/tmp/dnsmasq.' + s['.name'] + '.d';
+			return false;
+		});
+	} catch (e) { }
+	return (dir && substr(dir, 0, 1) == '/') ? dir : null;
+}
+
+function dnsmasq_has_nftset() {
+	let out = run_capture('dnsmasq --version').output;
+	return index(out, 'no-nftset') < 0 && index(out, 'nftset') >= 0;
+}
+
+// Строка списка уходит в конфиг dnsmasq как часть server=/…/ — пропускаем
+// только то, что похоже на имя, иначе один кривой домен уронит dnsmasq.
+function is_dns_name(d) {
+	return match(d, /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$/) != null;
+}
+
+// null — писать нечего (DNS через туннель выключен и режим не dns).
+function dnsmasq_text(p, o) {
+	if (!o.tunnel_dns && o.mode != 'dns') return null;
+	let out = '# сгенерировано vless-tunnel _dns-up, не править\n';
+	let up = '127.0.0.1#' + o.dns_port;
+	for (let d in o.domains) {
+		if (!is_dns_name(d)) continue;
+		if (o.tunnel_dns) out += 'server=/' + d + '/' + up + '\n';
+		// Обе семьи — ОДНОЙ директивой nftset= на домен: две отдельные для
+		// одного домена не складываются, dnsmasq молча запоминает только
+		// первую (проверено на стенде — vless6_dns оставался пустым).
+		if (o.mode == 'dns')
+			out += 'nftset=/' + d + '/4#inet#fw4#vless4_dns,6#inet#fw4#vless6_dns\n';
+	}
+	if (o.tunnel_dns) {
+		// '#' — «обычные серверы»: более точное совпадение побеждает, так
+		// исключение из direct-domains остаётся на DNS провайдера, даже если
+		// родительский домен есть в domains.
+		if (o.mode != 'dns')
+			for (let d in o.direct_domains)
+				if (is_dns_name(d)) out += 'server=/' + d + '/#\n';
+		// Домен самого сервера — только мимо туннеля: Xray резолвит его через
+		// тот же dnsmasq, и без этой строки поиск адреса сервера ушёл бы в
+		// туннель к этому же серверу.
+		if (p && !p.host_is_ip && is_dns_name(p.host))
+			out += 'server=/' + p.host + '/#\n';
+	}
+	return out;
+}
+
+// Перезапуск, а не reload: SIGHUP не перечитывает server=/nftset= из
+// conf-dir. Если dnsmasq после этого не поднялся — убираем свой файл и
+// поднимаем его заново: без dnsmasq у LAN нет ни DNS, ни DHCP.
+function dnsmasq_restart(path) {
+	run_capture('/etc/init.d/dnsmasq restart');
+	for (let i = 0; i < 5; i++) {
+		if (run_capture('pidof dnsmasq').code == 0) return true;
+		system('sleep 1');
+	}
+	if (path && fs.access(path)) {
+		fs.unlink(path);
+		run_capture('/etc/init.d/dnsmasq restart');
+	}
+	warn('предупреждение: dnsmasq не поднялся с ' + (path ?? 'новой конфигурацией') +
+		' — файл убран, dnsmasq перезапущен без него\n');
+	return false;
+}
+
+function cmd_dns_up() {
+	let cfg = cfg_get_all();
+	let o = default_opts();
+	let p = null;
+	try { if (cfg.link) p = parse_link(cfg.link); } catch (e) { }
+
+	let dir = dnsmasq_confdir();
+	if (!dir) {
+		warn('предупреждение: conf-dir dnsmasq не найден — DNS доменов из списка идёт как обычно\n');
+		return;
+	}
+	let path = dir + '/' + DNSMASQ_FILE;
+	let changed = false;
+	if (path != DNSMASQ_LEGACY && fs.access(DNSMASQ_LEGACY)) {
+		fs.unlink(DNSMASQ_LEGACY);
+		changed = true;
+	}
+
+	let text = dnsmasq_text(p, o);
+	if (text == null) {
+		if (fs.access(path)) { fs.unlink(path); changed = true; }
+	} else if (read_file(path) != text) {
+		let tmp = '/tmp/vless-tunnel-dnsmasq.conf';
+		write_file(tmp, text);
+		let t = run_capture('dnsmasq --test -C ' + tmp);
+		fs.unlink(tmp);
+		if (t.code != 0) {
+			warn('предупреждение: dnsmasq отверг сгенерированный ' + DNSMASQ_FILE +
+				' — оставляю прежний:\n' + t.output);
+		} else {
+			ensure_dir(dir);
+			write_file(path, text);
+			changed = true;
+		}
+	}
+	if (changed) dnsmasq_restart(path);
+}
+
+function cmd_dns_down() {
+	let dir = dnsmasq_confdir();
+	let changed = false;
+	for (let path in [dir ? dir + '/' + DNSMASQ_FILE : null, DNSMASQ_LEGACY])
+		if (path && fs.access(path)) { fs.unlink(path); changed = true; }
+	if (changed) dnsmasq_restart(null);
+}
+
+// --- nftables: шаблон под режим, применение одной транзакцией ------------
+// whitelist/proxy и dns отличаются набором сетов и цепочек (см. оба
+// шаблона), поэтому при смене «семейства» режима nft-файл пересобирается.
+// destroy + объявление заново — одним `nft -f`: либо применится всё, либо
+// ничего, и при ошибке живой ruleset остаётся прежним. Ручной bypass не
+// трогаем — его элементы добавляют руками, и они переживают смену режима.
+const NFT_OWN_SETS = ['vless4', 'vless4_dns', 'vless6', 'vless6_dns', 'vless4_server', 'vless6_server'];
+
+function cmd_apply_nft() {
+	let cfg = cfg_get_all();
+	let dns = cfg.mode == 'dns';
+	let tpl = read_file(dns ? NFT_TEMPLATE_DNS : NFT_TEMPLATE);
+	if (!tpl) fail('нет шаблона nft-правил в ' + SHARE_DIR + ' — переустановите (sh install.sh)');
+	let port = int(cfg.tproxy_port);
+	if (!match(cfg.lan, /^[A-Za-z0-9._-]+$/) || hex_to_int(cfg.fwmark) == null || port < 1 || port > 65535)
+		fail('lan/fwmark/tproxy_port в /etc/config/' + UCI_CONF + ' некорректны');
+	let body = replace(replace(replace(tpl, '__LAN_IFACE__', cfg.lan),
+		'__FWMARK__', cfg.fwmark), '__TPROXY_PORT__', '' + port);
+
+	let script = 'destroy chain inet fw4 vless_prerouting\ndestroy chain inet fw4 vless_prerouting6\n';
+	for (let s in NFT_OWN_SETS) script += 'destroy set inet fw4 ' + s + '\n';
+	script += 'table inet fw4 {\n' + body + '\n}\n';
+	// Адреса сервера (sniffing-режимы) — сразу, не дожидаясь _build-config.
+	let server = dns ? null : read_file(SERVER_NFT_FILE);
+	if (server) script += 'table inet fw4 {\n' + server + '\n}\n';
+
+	let tmp = '/tmp/vless-tunnel-apply.nft';
+	write_file(tmp, script);
+	let chk = run_capture('nft -c -f ' + tmp);
+	if (chk.code != 0) {
+		fs.unlink(tmp);
+		fail('nft-правила не прошли проверку, ничего не менял:\n' + chk.output);
+	}
+	let r = run_capture('nft -f ' + tmp);
+	fs.unlink(tmp);
+	if (r.code != 0) fail('не удалось применить nft-правила:\n' + r.output);
+
+	write_file(NFT_FILE, body);
+	// В режиме dns обход сервера не нужен: в TPROXY идут только адреса из сетов.
+	if (dns && fs.access(SERVER_NFT_FILE)) fs.unlink(SERVER_NFT_FILE);
+	print('nft-правила (' + (dns ? 'dns' : 'sniffing') + ') применены\n');
+}
+
+// --- жив ли сервер по мнению observatory (fallback=1) --------------------
+// null — неизвестно: Xray не запущен, fallback выключен или первая проба
+// ещё не закончилась.
+function tunnel_state() {
+	let r = run_capture('wget -q -T 3 -O- http://' + METRICS_ADDR + '/debug/vars');
+	if (r.code != 0) return null;
+	let j = null;
+	try { j = json(r.output); } catch (e) { return null; }
+	let s = (type(j) == 'object' && type(j.observatory) == 'object') ? j.observatory.proxy : null;
+	if (type(s) != 'object') return null;
+	return { alive: s.alive == true, delay: s.delay, error: s.last_error_reason };
 }
 
 // --- тестовый (нетуннельный) конфиг для `test` --------------------------
@@ -830,7 +1162,10 @@ function cmd_build_config() {
 	write_config_json(built);
 
 	// Домен сервера не отрезолвился (например, WAN при загрузке ещё не
-	// поднят) — прежние адреса в обходе лучше пустого списка.
+	// поднят) — прежние адреса в обходе лучше пустого списка. В режиме dns
+	// сетов обхода нет вовсе (см. cmd_apply_nft).
+	if (o.mode == 'dns')
+		return;
 	if (length(o.server_ips))
 		sync_server_bypass(o.server_ips);
 	else
@@ -919,14 +1254,27 @@ function cmd_status() {
 	}
 
 	let o = default_opts();
-	print('режим: ' + (o.mode == 'proxy'
-		? 'proxy (весь веб в туннель, кроме RU и direct-domains)'
-		: 'whitelist (в туннель только domains/subnets)') + '\n');
+	print('режим: ' + mode_title(o.mode) + '\n');
 	print('в туннель по домену: ' + length(o.domains) + ', по IP: ' + length(o.subnets) +
-		', всегда напрямую: ' + length(o.direct_domains) + '\n');
+		(o.mode == 'dns' ? '' : ', всегда напрямую: ' + length(o.direct_domains)) + '\n');
 	if (o.mode == 'proxy' && !o.geoip_ok)
 		print('ВНИМАНИЕ: mode=proxy, но нет ' + o.geoip +
 			' — правило geoip:ru не добавлено, RU-адреса пойдут в туннель; vless-tunnel update-geo\n');
+	print('DNS доменов из списка: ' + (o.tunnel_dns
+		? 'через туннель (' + o.dns_upstream + ' с сервера)' : 'как обычно, через DNS роутера') + '\n');
+
+	// Строка «туннель:» — её же показывает веб-страница.
+	if (!o.fallback) {
+		print('туннель: без fallback (сервер недоступен → туннельный трафик не идёт)\n');
+	} else if (cfg.enabled == '1' && service_running()) {
+		let st = tunnel_state();
+		if (!st)
+			print('туннель: состояние пока неизвестно (первая проверка сервера идёт)\n');
+		else if (st.alive)
+			print('туннель: сервер доступен (' + st.delay + ' мс)\n');
+		else
+			print('туннель: СЕРВЕР НЕДОСТУПЕН — туннельный трафик идёт напрямую (fallback)\n');
+	}
 }
 
 // Проверка связи с сервером в обход nftables/TPROXY: временный http-
@@ -986,6 +1334,23 @@ function cmd_doctor() {
 	ok = check('модуль ядра nft_tproxy загружен', mod.code == 0,
 		mod.code == 0 ? null : 'apk add kmod-nft-tproxy kmod-nf-tproxy') && ok;
 
+	let cfg = cfg_get_all();
+	let o = default_opts();
+	ok = check('режим: ' + mode_title(o.mode), cfg.mode in MODES,
+		(cfg.mode in MODES) ? null : 'неизвестный mode=' + cfg.mode + ' — vless-tunnel mode whitelist|proxy|dns') && ok;
+
+	// В режиме dns домены тегирует dnsmasq через nftset= — без dnsmasq-full
+	// список молча не работает. А nft-файл должен быть от того же режима.
+	if (o.mode == 'dns')
+		ok = check('dnsmasq собран с поддержкой nftset (dnsmasq-full)', dnsmasq_has_nftset(),
+			dnsmasq_has_nftset() ? null : 'переустановите: sh install.sh dns') && ok;
+	if (chain.code == 0) {
+		let dns_chain = index(chain.output, '@vless4_dns') >= 0;
+		let same = dns_chain == (o.mode == 'dns');
+		ok = check('nft-правила от текущего режима', same,
+			same ? null : 'vless-tunnel _apply-nft && /etc/init.d/vless-tunnel restart') && ok;
+	}
+
 	// flow offload уводит установленные потоки мимо netfilter/TPROXY:
 	// часть соединений уходит напрямую (с российским IP), хотя должна
 	// быть в туннеле. Именно так «на компьютере работает, а приложение
@@ -995,8 +1360,6 @@ function cmd_doctor() {
 	let offload = off_sw == '1' || off_hw == '1';
 	ok = check('flow offloading выключен (TPROXY с ним несовместим)', !offload,
 		offload ? 'uci set firewall.@defaults[0].flow_offloading=0; uci set firewall.@defaults[0].flow_offloading_hw=0; uci commit firewall; fw4 reload' : null) && ok;
-
-	let cfg = cfg_get_all();
 
 	// Если https-dns-proxy удалили, а в dnsmasq остался server=127.0.0.1#5053
 	// (или #5054) — резолв уходит в мёртвый порт: интернет «моргает»
@@ -1010,9 +1373,9 @@ function cmd_doctor() {
 	else
 		check('dnsmasq не смотрит в мёртвый DoH-порт', true);
 
-	// nft-файл подставляется из UCI один раз, при установке (см. install*.sh)
-	// — если fwmark/tproxy_port поменяли в UCI без переустановки, здесь это
-	// разойдётся молча, кроме как в этой проверке.
+	// nft-файл собирается из UCI при установке и смене режима (_apply-nft) —
+	// если fwmark/tproxy_port поменяли в UCI руками, здесь это разойдётся
+	// молча, кроме как в этой проверке.
 	if (chain.code == 0) {
 		let mark_m = match(chain.output, /mark set (0x[0-9a-fA-F]+)/);
 		let port_m = match(chain.output, /tproxy ip6? to :([0-9]+)/);
@@ -1020,7 +1383,7 @@ function cmd_doctor() {
 			hex_to_int(mark_m[1]) == hex_to_int(cfg.fwmark) &&
 			int(port_m[1]) == int(cfg.tproxy_port);
 		ok = check('nft-правила совпадают с fwmark/tproxy_port из UCI', synced,
-			synced ? null : 'значения разошлись — переустановите (sh install*.sh), nft-файл соберётся заново из UCI') && ok;
+			synced ? null : 'значения разошлись — vless-tunnel _apply-nft && /etc/init.d/vless-tunnel restart') && ok;
 	}
 
 	ok = check('ссылка сервера задана', cfg.link != '') && ok;
@@ -1036,8 +1399,9 @@ function cmd_doctor() {
 	}
 
 	// Без этого клиенты LAN с той же ссылкой (десктопный VLESS, VPN на
-	// телефоне) заворачиваются в туннель роутера и не работают вовсе.
-	if (p && chain.code == 0) {
+	// телефоне) заворачиваются в туннель роутера и не работают вовсе. В
+	// режиме dns в TPROXY идут только адреса из сетов — обход не нужен.
+	if (p && chain.code == 0 && o.mode != 'dns') {
 		let ips = server_ips(p);
 		let sets = run_capture('nft list set inet fw4 vless4_server; nft list set inet fw4 vless6_server').output;
 		let elems = map(match(sets, /[0-9A-Fa-f]*[.:][0-9A-Fa-f.:]+/g) ?? [], (m) => m[0]);
@@ -1049,16 +1413,14 @@ function cmd_doctor() {
 				(fs.access(SERVER_NFT_FILE) ? '' : '; если не поможет — переустановите (sh install.sh)')) && ok;
 	}
 
-	ok = check('режим: ' + (cfg.mode == 'proxy' ? 'proxy' : 'whitelist'), true) && ok;
-	if (cfg.mode == 'proxy') {
+	if (o.mode == 'proxy') {
 		let geo = !!fs.access(cfg.geoip);
 		ok = check('geoip.dat на месте (' + cfg.geoip + ')', geo,
 			geo ? null : 'vless-tunnel update-geo') && ok;
 	}
 
-	let o = default_opts();
 	check('доменов в списке: ' + length(o.domains) + ', IP-подсетей: ' + length(o.subnets) +
-		', всегда напрямую: ' + length(o.direct_domains), true);
+		(o.mode == 'dns' ? '' : ', всегда напрямую: ' + length(o.direct_domains)), true);
 
 	if (fs.access(CONFIG_JSON) && fs.access(XRAY_BIN)) {
 		let r = run_capture(XRAY_ENV + XRAY_BIN + ' run -test -c ' + CONFIG_JSON);
@@ -1096,6 +1458,41 @@ function cmd_doctor() {
 		let has_route6 = index(run_capture('ip -6 route list table ' + cfg.table).output, 'local default') >= 0;
 		ok = check('local-маршрут (v6) в table ' + cfg.table + ' на месте',
 			has_route6, has_route6 ? null : restart_hint) && ok;
+
+		// DNS доменов из списка: файл на месте, и домен из списка через
+		// dnsmasq резолвится не в заглушку провайдера (127.0.0.1, 0.0.0.0).
+		if (o.tunnel_dns || o.mode == 'dns') {
+			let dir = dnsmasq_confdir();
+			let has_file = dir && fs.access(dir + '/' + DNSMASQ_FILE);
+			ok = check('dnsmasq получил ' + DNSMASQ_FILE + ' (' + (dir ?? 'conf-dir не найден') + ')',
+				!!has_file, has_file ? null : restart_hint) && ok;
+		}
+		let probe = null;
+		for (let d in o.domains)
+			if (is_dns_name(d)) { probe = d; break; }
+		if (o.tunnel_dns && probe) {
+			let r = run_capture('nslookup -type=a ' + probe + ' 127.0.0.1');
+			let addrs = [], answer = false;
+			for (let line in split(r.output, '\n')) {
+				if (match(line, /^Name:/)) answer = true;
+				let m = answer ? match(line, /^Address:[ \t]*([0-9.]+)/) : null;
+				if (m) push(addrs, m[1]);
+			}
+			let good = length(addrs) && !length(filter(addrs, (a) => match(a, /^(127\.|0\.)/)));
+			ok = check('DNS через туннель: ' + probe + ' → ' + (length(addrs) ? join(' ', addrs) : 'нет ответа'),
+				good, good ? null : 'нет ответа или заглушка; напрямую через Xray: nslookup ' + probe +
+					' 127.0.0.1:' + o.dns_port) && ok;
+		}
+
+		if (o.fallback) {
+			let st = tunnel_state();
+			if (st && !st.alive)
+				ok = check('сервер доступен через туннель', false,
+					'нет — туннельный трафик идёт напрямую (fallback); ' + (st.error ?? '')) && ok;
+			else
+				check('сервер доступен через туннель', true,
+					st ? st.delay + ' мс' : 'первая проверка ещё идёт');
+		}
 	}
 
 	print(ok ? '\nвсё в порядке.\n' : '\nесть проблемы, см. выше.\n');
@@ -1209,17 +1606,26 @@ function cmd_set_direct_file(tmp_path) {
 	apply_lists_change();
 }
 
+// whitelist ↔ proxy — только пересборка config.json. Переход в dns или из
+// него меняет и nft-правила (другие сеты и цепочки, см. cmd_apply_nft), а
+// для dns ещё нужен dnsmasq-full — его ставит только install.sh dns:
+// замена dnsmasq на лету — ровно та операция, что однажды оставила роутер
+// без DNS и DHCP.
 function cmd_mode(arg) {
 	let cfg = cfg_get_all();
 	if (!arg) {
-		print('режим: ' + (cfg.mode == 'proxy' ? 'proxy' : 'whitelist') + '\n');
+		print('режим: ' + mode_title(cfg.mode) + '\n');
 		return;
 	}
 	arg = lc(trim(arg));
-	if (!(arg in {whitelist: 1, proxy: 1}))
-		fail('режим должен быть whitelist или proxy');
+	if (!(arg in MODES))
+		fail('режим должен быть whitelist, proxy или dns');
+	if (arg == 'dns' && !dnsmasq_has_nftset())
+		fail('для режима dns нужен dnsmasq-full — переустановите: sh install.sh dns');
+	let family_changed = (cfg.mode == 'dns') != (arg == 'dns');
 	cfg_set({ mode: arg });
 	print('режим: ' + arg + '\n');
+	if (family_changed) cmd_apply_nft();
 	apply_lists_change();
 	if (arg == 'proxy' && !fs.access(cfg.geoip))
 		print('geoip.dat ещё нет — выполните vless-tunnel update-geo, иначе RU-адреса пойдут в туннель\n');
@@ -1273,33 +1679,66 @@ function cmd_update_geo() {
 	print('geoip.dat обновлён\n');
 }
 
-// Снимает только то, что сами же добавили в живой ruleset — целенаправленно
-// через nft delete, а не через fw4 reload: на роутере рядом вполне может
-// стоять другой сервис со своими nft-правилами мимо /etc/nftables.d
-// (см. HANDOFF.md), и полный reload их бы снёс.
-function cmd_uninstall() {
+// Полное удаление: служба, правила, DNS-файл dnsmasq, конфигурация, списки,
+// веб-страница и сам CLI. Снимает только то, что сами же добавили в живой
+// ruleset — через nft destroy, а не через fw4 reload: на роутере рядом
+// вполне может стоять другой сервис со своими nft-правилами мимо
+// /etc/nftables.d (см. HANDOFF.md), и полный reload их бы снёс.
+//
+// flow offloading возвращается в то состояние, что было до установки
+// (install.sh запоминает его в UCI). dnsmasq-full (режим dns) остаётся: он
+// работает как обычный dnsmasq, а обратная замена — та же опасная операция,
+// что и прямая. --purge дополнительно удаляет пакет xray-core.
+function cmd_uninstall(arg) {
+	let purge = arg == '--purge';
+	if (arg && !purge) fail('неизвестный аргумент: ' + arg + ' (ожидается --purge)');
+	// saved_offload_* пишет только install.sh, в cfg_defaults их нет
+	let saved = {};
+	try { saved = uci.cursor().get_all(UCI_CONF, 'main') ?? {}; } catch (e) { }
+
 	if (fs.access(INIT_SCRIPT)) {
 		run_capture(INIT_SCRIPT + ' stop');
 		run_capture(INIT_SCRIPT + ' disable');
 	}
-	for (let name in ['vless_prerouting', 'vless_prerouting6'])
-		system('nft delete chain inet fw4 ' + name + ' 2>/dev/null');
-	for (let name in ['vless4_bypass', 'vless6_bypass', 'vless4_server', 'vless6_server'])
-		system('nft delete set inet fw4 ' + name + ' 2>/dev/null');
+	// stop уже убрал DNS-файл, если служба работала; если нет — убираем здесь.
+	cmd_dns_down();
 
+	let script = 'destroy chain inet fw4 vless_prerouting\ndestroy chain inet fw4 vless_prerouting6\n';
+	for (let s in NFT_OWN_SETS)
+		script += 'destroy set inet fw4 ' + s + '\n';
+	script += 'destroy set inet fw4 vless4_bypass\ndestroy set inet fw4 vless6_bypass\n';
+	let tmp = '/tmp/vless-tunnel-uninstall.nft';
+	write_file(tmp, script);
+	let r = run_capture('nft -f ' + tmp);
+	fs.unlink(tmp);
+	if (r.code != 0) warn('предупреждение: nft-правила сняты не полностью:\n' + r.output);
 	fs.unlink(NFT_FILE);
 	fs.unlink(SERVER_NFT_FILE);
 
-	system('rm -rf ' + CONFIG_DIR);
-	system('uci -q delete ' + UCI_CONF + '.main; uci commit ' + UCI_CONF);
+	if (saved.saved_offload_sw == '1' || saved.saved_offload_hw == '1') {
+		system('uci -q set firewall.@defaults[0].flow_offloading=' + (saved.saved_offload_sw == '1' ? '1' : '0') +
+			'; uci -q set firewall.@defaults[0].flow_offloading_hw=' + (saved.saved_offload_hw == '1' ? '1' : '0') +
+			'; uci commit firewall; fw4 reload >/dev/null 2>&1');
+		print('flow offloading включён обратно, как было до установки\n');
+	}
+
+	system('rm -rf ' + CONFIG_DIR + ' ' + SHARE_DIR);
 	fs.unlink('/etc/config/' + UCI_CONF);
 	fs.unlink(INIT_SCRIPT);
 	fs.unlink('/www/cgi-bin/vless-tunnel');
 	fs.unlink('/www/t.html');
+	fs.unlink(SELF_BIN);
+
+	if (purge) {
+		let a = run_capture('apk del xray-core');
+		print(a.code == 0 ? 'пакет xray-core удалён\n' : 'предупреждение: apk del xray-core: ' + a.output);
+	}
 
 	print('vless-tunnel удалён.\n');
-	print('Пакет xray-core и сам ' + '/usr/bin/vless-tunnel' +
-		' не тронуты — уберите вручную при необходимости.\n');
+	if (!purge)
+		print('Пакет xray-core оставлен — удалить: apk del xray-core\n');
+	if (dnsmasq_has_nftset())
+		print('dnsmasq-full оставлен: он работает как обычный dnsmasq\n');
 }
 
 function usage_text() {
@@ -1316,10 +1755,11 @@ function usage_text() {
 		'  direct-domains        домены, которые всегда напрямую\n' +
 		'  add-direct <домен>    добавить домен в исключения (всегда напрямую)\n' +
 		'  remove-direct <домен> убрать домен из исключений\n' +
-		'  mode [proxy|whitelist] режим: proxy — весь веб в туннель кроме RU,\n' +
-		'                        whitelist — только domains/subnets\n' +
+		'  mode [whitelist|proxy|dns]  режим: whitelist — только domains/subnets,\n' +
+		'                        proxy — весь веб в туннель кроме RU,\n' +
+		'                        dns — domains/subnets, решение по DNS (нужен install.sh dns)\n' +
 		'  update-geo            скачать/обновить geoip.dat (нужен для mode=proxy)\n' +
-		'  uninstall             удалить конфигурацию и правила\n' +
+		'  uninstall [--purge]   удалить vless-tunnel целиком (--purge — и xray-core)\n' +
 		'  help                  показать эту справку\n' +
 		'  parse <ссылка>        разобрать ссылку и напечатать разбор (отладка)\n' +
 		'  make <ссылка> <файл>  собрать config.json в указанный файл (отладка)\n';
@@ -1361,9 +1801,15 @@ try {
 	} else if (cmd == 'doctor') {
 		cmd_doctor();
 	} else if (cmd == 'uninstall') {
-		cmd_uninstall();
+		cmd_uninstall(args[1]);
 	} else if (cmd == '_build-config') {
 		cmd_build_config();
+	} else if (cmd == '_apply-nft') {
+		cmd_apply_nft();
+	} else if (cmd == '_dns-up') {
+		cmd_dns_up();
+	} else if (cmd == '_dns-down') {
+		cmd_dns_down();
 	} else if (cmd == 'domains') {
 		cmd_domains();
 	} else if (cmd == 'add-domain') {

@@ -5,11 +5,12 @@
 # восстанавливаются сами при `fw4 reload`, рестарте сети и поднятии WAN:
 # отдельный сторож не нужен.
 #
-# __LAN_IFACE__/__FWMARK__/__TPROXY_PORT__ — плейсхолдеры. install.sh
-# подставляет в них значения из UCI (vless-tunnel.main.lan/fwmark/
-# tproxy_port, те же, что использует vless-tunnel.init для `ip rule`
-# и сам Xray для listen-порта) один раз, при установке файла в
-# /etc/nftables.d/ — сам этот файл в репозитории неисполняемый шаблон.
+# __LAN_IFACE__/__FWMARK__/__TPROXY_PORT__ — плейсхолдеры. Файл ставится
+# шаблоном в /usr/share/vless-tunnel/, а `vless-tunnel _apply-nft` (его
+# зовут install.sh и смена режима) подставляет значения из UCI
+# (vless-tunnel.main.lan/fwmark/tproxy_port — те же, что использует init для
+# `ip rule` и сам Xray для listen-порта) и пишет в /etc/nftables.d/.
+# Это шаблон режимов whitelist/proxy; для режима dns — 10-vless-tunnel-dns.nft.
 #
 # Проверить, что подхватилось:  nft list ruleset | grep -A20 vless
 #

@@ -3,55 +3,60 @@
 Документ для передачи задачи: что решено, почему, и что делать дальше.
 Не спецификация «на будущее» — это текущее состояние проекта на момент передачи.
 
-## Текущее состояние на 25.10.2026 (читать первым)
+## Текущее состояние на 26.10.2026 (читать первым)
 
-- **Роутер `192.168.1.1`**: OpenWrt 25.12.6 r33311 (владелец перепрошил
-  начисто 25.10), WAN — PPPoE, `flow_offloading` не задан (выключен).
-  **25.10 в 20:16 поставлен sniffing-вариант из `main` (коммит aaa54f0)
-  в режиме `whitelist`** — командой из README, затем `vless-tunnel on`;
-  DoH не ставился. Проверено сразу после установки: `doctor` весь
-  зелёный (в т.ч. «сервер 130.17.21.198 идёт мимо Xray»); LAN-клиент:
-  ya.ru — напрямую, YouTube/ChatGPT — через туннель (`loc=DE`); клиент со
-  своим VLESS на ту же ссылку (как десктоп владельца) работает, ошибок
-  REALITY нет; Xray RSS 28 МБ, CPU ~0; access-строк в syslog 0.
-  Перезагрузку роутера после установки не проверяли (на стенде — да).
-  Выключить: `vless-tunnel off`; удалить: `vless-tunnel uninstall`.
-- **Главная причина «у меня ничего не работает»** со старыми скриптами:
-  роутер заворачивал в свой туннель чужие VLESS-соединения до того же
-  VPS (десктопный клиент владельца, приложения на телефонах) — см.
-  «Тест 25.10.2026: туннель в туннеле». Исправлено (коммит addf231): IP
-  сервера автоматически мимо Xray.
-- **`install-dns.sh` может оставить роутер без DNS и DHCP** — см.
-  «Открытые вопросы»; не запускать на реальном роутере до исправления.
-- **Мелкий баг `install.sh`**: предупреждение «собрано и проверено на
-  aarch64_cortex-a53, здесь » с пустой архитектурой — даже на aarch64:
-  проверяется `$OPENWRT_ARCH`, которой в `/etc/openwrt_release` 25.12 нет
-  (там `DISTRIB_ARCH`). Безвредно.
-- **Репозиторий**: всё закоммичено и запушено в `main` (695a2f1 — режим
-  `proxy` и прочее; addf231 — обход сервера; 0424f68 — документация;
-  aaa54f0 — `local-deploy/vless-tunnel-local.tar.gz`, без секретов).
-- **Стенд**: убран (контейнеры `vt-router`/`vt-client`/`vt-vps`, сети
-  `vt-wan`/`vt-lan`); образ `openwrt:25.12.6` (импорт rootfs r33311 x86-64)
-  оставлен для следующих тестов. На хосте владельца
-  (192.168.1.196) постоянно работает десктопный клиент
-  `github.com/RamDll/vless-tunnel` (systemd `vless-tunnel`, весь трафик
-  хоста → VPS) — сессия агента тоже идёт через VPS.
-- **VPS `130.17.21.198`**: жив, Xray 26.3.27 работает, 1 CPU / 1 ГБ RAM,
-  load ~0.1; 25.10 в 15:02 UTC владелец обновил пакеты и перезагрузил его.
-  В `mode proxy` связь с ним с домашнего IP один раз пропала (SSH
-  banner timeout, `vless-tunnel test` — таймаут). Разбор журналов
-  сервера показал: **это не перегрузка** — в те же минуты сервер
-  нормально обслуживал других клиентов; сломан был путь «дом ↔ VPS»
-  (см. «Инцидент 25.10.2026»). Более мощный VPS эту проблему не решает.
-- **Следующий шаг** (план, согласованный с владельцем): пожить на
-  `whitelist` день-два; затем авто-фолбэк proxy → direct, если VPS
-  недоступен (наблюдение за outbound в Xray), проверить на стенде, и
-  только после этого `update-geo` + `mode proxy` на роутере — иначе в
-  `proxy` при обрыве пути «дом ↔ VPS» у всей квартиры пропадает весь
-  зарубежный веб. Отдельно — починить или убрать `install-dns.sh`.
-  Десктопный клиент владельца не выключать: это независимый канал (и
-  через него идёт сессия агента). Ссылка сервера в
-  репозитории не хранится (секция `forkop` в бэкапе
+- **Код**: один установщик на три режима — `sh install.sh
+  whitelist|proxy|dns [ссылка]`; отдельные `install-dns.sh` и
+  `vless-tunnel-dns*` удалены, режим `dns` живёт в общем CLI/init
+  (`mode=dns`, nft-шаблон `10-vless-tunnel-dns.nft`). Новое во всех
+  режимах: DNS доменов из `domains` через туннель, fallback «сервер
+  недоступен → напрямую», полное удаление `vless-tunnel uninstall
+  [--purge]`, безопасная замена dnsmasq на dnsmasq-full. Всё проверено на
+  Docker-стенде — см. «26.10.2026: три режима, DNS через туннель,
+  fallback». **На реальный роутер новая версия ещё не ставилась.**
+- **Роутер `192.168.1.1`**: OpenWrt 25.12.6 r33311, WAN — PPPoE, flow
+  offloading выключен. С вечера 25.10 стоит прежняя версия из `main`
+  (коммит aaa54f0) в режиме `whitelist`, `doctor` зелёный. Найдено 26.10:
+  **DNS провайдера (Ростелеком, 78.37.77.77 / 212.48.197.77) отдаёт
+  `127.0.0.1` на instagram.com, www.instagram.com, i./graph.instagram.com,
+  facebook.com, www.facebook.com, static.xx.fbcdn.net** (dnsmasq роутера
+  пропускает это клиентам — `rebind_localhost=1`). Устройство соединяется
+  само с собой, пакет до роутера не доходит — Instagram/Facebook у LAN-
+  клиентов без своего DoH/VPN не работают в любой версии со старым DNS.
+  Новая версия это и чинит (DNS списка через туннель). Остальные
+  проверенные домены (YouTube, ChatGPT, X, Discord, GitHub, Reddit,
+  Twitch, Netflix, rutracker, LinkedIn…) у провайдера честные.
+- **Подмена на пути, не у провайдера**: прямой UDP-запрос из дома к
+  `1.1.1.1` на `youtube.com` и `www.facebook.com` получает NXDOMAIN
+  (на `instagram.com` — честный ответ); Ростелеком на youtube.com отвечает
+  честно. Поэтому при недоступном сервере DNS списка идёт на DNS
+  провайдера (`dns-direct`), а не на `1.1.1.1` напрямую.
+- **Стенд поднят**: `vt-router` (WAN 198.51.100.2, LAN 10.77.0.1),
+  `vt-client` (10.77.0.10), `vt-vps` (198.51.100.10, VLESS+XHTTP+REALITY
+  +mlkem как настоящий), `vt-isp` (198.51.100.53 — dnsmasq, подменяет
+  instagram.com/facebook.com на 127.0.0.1, как Ростелеком); сети
+  `vt-wan`/`vt-lan`; образ `openwrt:25.12.6`. Выход стенда в интернет —
+  через домашний канал, поэтому «VPS» стенда видит ту же фильтрацию, что и
+  дом: `youtube.com` через туннель стенда → NXDOMAIN (на стенде для
+  зелёного `doctor` стоит `dns_upstream=77.88.8.8`). `vless-tunnel test` на
+  стенде падает и в старой версии («Connection reset prematurely» —
+  особенность стенда), на реальном роутере 25.10 работал.
+- **Десктопный клиент владельца** (192.168.1.196, systemd `vless-tunnel`):
+  с 26.10 00:55 выключен, сессия агента идёт через туннель роутера
+  (`anthropic.com`, `claude.ai` есть в `domains`) — перезапуск Xray на
+  роутере обрывает и её. Обрывы Claude 25.10 вечером (22:24, 22:45, 00:13,
+  00:34 МСК, все «Connection lost mid-response») были при включённом
+  десктопном клиенте, то есть на пути «дом ↔ VPS», не из-за DNS.
+- **VPS `130.17.21.198`**: жив, Xray 26.3.27, 1 CPU / 1 ГБ RAM; 25.10 в
+  15:02 UTC владелец обновил пакеты и перезагрузил его. Логи Xray на
+  сервере выключены (`access.log`/`error.log` пустые). В `mode proxy` связь
+  с домашнего IP один раз пропадала — это путь «дом ↔ VPS», не перегрузка
+  (см. «Инцидент 25.10.2026»); от этого теперь страхует fallback.
+- **Следующий шаг**: поставить новую версию на роутер с планом отката
+  (сначала обновление поверх — `sh install.sh` без режима оставит
+  `whitelist`), проверить Instagram с телефона по Wi-Fi без VPN, `doctor`,
+  fallback; затем `sh install.sh proxy`. Ссылка сервера в репозитории не
+  хранится (секция `forkop` в бэкапе
   `~/router-backups/backup-cudy-20260910-2103.tar.gz`).
 
 ## Задача
@@ -171,36 +176,44 @@ DNS-ответа, а через **sniffing** прямо из TLS SNI / HTTP Host
 
 ## Что уже написано
 
-- `10-vless-tunnel.nft` → `/etc/nftables.d/` — один сет (`vless4_bypass`,
-  ручной «всегда напрямую») и цепочка `vless_prerouting`: приватные сети и
-  bypass — `return`, весь остальной TCP/UDP — `tproxy ip to :12345`.
-  Решение по домену/IP из списков внутри этого TPROXY уже не принимается
-  здесь — им занимается `routing.rules` в `config.json` (см. ниже).
-  `vless_prerouting6` — зеркало для IPv6, тоже перехватывает и заворачивает
-  в TPROXY (см. «IPv6 — реализовано и проверено» ниже; старый `vless_forward6`,
-  который просто глушил IPv6, из кода убран).
+- `10-vless-tunnel.nft` и `10-vless-tunnel-dns.nft` → шаблоны в
+  `/usr/share/vless-tunnel/`; `vless-tunnel _apply-nft` собирает из нужного
+  `/etc/nftables.d/10-vless-tunnel.nft` (подставляет lan/fwmark/tproxy_port
+  из UCI). Sniffing-шаблон: сеты `vless4_bypass` (ручной «всегда
+  напрямую»), `vless4_server` (сервер туннеля) и цепочка
+  `vless_prerouting`: приватные сети, сервер и bypass — `return`, весь
+  остальной TCP/UDP — `tproxy ip to :12345`; решение по домену/IP —
+  `routing.rules` в `config.json`. dns-шаблон: TPROXY только для адресов из
+  `vless4` (`subnets`) и `vless4_dns` (наполняет dnsmasq). У обоих
+  `vless_prerouting6` — зеркало для IPv6 (см. «IPv6 — реализовано и
+  проверено»). `11-vless-tunnel-server.nft` пишет `_build-config`
+  (адреса сервера, sniffing-режимы).
 - `vless-tunnel.init` → `/etc/init.d/vless-tunnel` — procd. На каждом
   старте зовёт `vless-tunnel _build-config` (пересобирает `config.json` из
-  сохранённой в UCI ссылки + текущих `domains`/`subnets` — так правки в
-  списках применяются без повторного `set-link`), ждёт порт
-  (`wait_for_port`), затем `route_up` (policy routing). На `stop` —
-  `route_down`. Никакой dnsmasq/sets-обвязки больше нет.
+  сохранённой в UCI ссылки + текущих списков), ждёт порт
+  (`wait_for_port`), затем `route_up` (policy routing), в режиме dns —
+  `sets_load` (`subnets` в сеты), и `_dns-up` (файл для dnsmasq). На
+  `stop` — `_dns-down` и `route_down`.
 - `vless-tunnel.config` → `/etc/config/vless-tunnel` — UCI.
 - `vless-tunnel` → `/usr/bin/vless-tunnel` — разбор `vless://`, сборка
-  `config.json` (VLESS + freedom outbound, sniffing, routing.rules из
-  `domains`/`subnets`). Команды: `setup`, `set-link`, `on`/`off`, `status`,
-  `test`, `doctor`, `uninstall`, внутренняя `_build-config`, отладочные
-  `parse`/`make`.
+  `config.json` (VLESS + freedom, sniffing, routing.rules, `dns-in`,
+  балансеры с fallback, observatory). Команды: `setup`, `set-link`,
+  `on`/`off`, `status`, `test`, `doctor`, `mode`, `update-geo`, списки,
+  `uninstall [--purge]`; внутренние `_build-config`, `_apply-nft`,
+  `_dns-up`/`_dns-down`, `_set-*-file`; отладочные `parse`/`make`.
 - `vless-tunnel-web` → `/www/cgi-bin/vless-tunnel` + `vless-tunnel-redirect.html`
-  → `/www/t.html` — минимальная веб-страница (не LuCI): статус, смена
-  ссылки, on/off. Без пароля, только LAN. Ключ шифрования нигде не
-  отображается.
-- `install.sh` — качает/проверяет файлы (локально или по sha256 с
-  `$VLESS_TUNNEL_BASE_URL`), ставит `xray-core`, убирает следы старой
-  (dnsmasq-based) установки при апгрейде, накатывает nftables точечно (без
-  `fw4 reload`), **перезапускает уже включённую службу**, если это
+  → `/www/t.html` — минимальная веб-страница (не LuCI): статус, режим,
+  доступность сервера, смена ссылки, on/off, домены. Без пароля, только
+  LAN. Ключ шифрования нигде не отображается.
+- `install.sh [whitelist|proxy|dns] [ссылка]` — качает/проверяет файлы
+  (локально или по sha256 с `$VLESS_TUNNEL_BASE_URL`), ставит `xray-core`,
+  kmod'ы, для dns — dnsmasq-full, кладёт файлы, выключает offload
+  (запомнив прежнее), ставит режим, `_apply-nft`, ссылку, для proxy —
+  `geoip.dat`, **перезапускает уже включённую службу**, если это
   переустановка (см. «Опасный момент», найден и закрыт при миграции на
   реальном роутере).
+- `local-deploy/vless-tunnel-local.tar.gz` — те же файлы одним архивом для
+  установки без GitHub (пересобирать при каждом изменении файлов).
 
 ## Эволюция архитектуры: почему решение 3 переписано
 
@@ -669,21 +682,114 @@ xray-клиентом на ту же ссылку, переподключает�
   заворачивался) не доказана — по журналам VPS путь «дом ↔ VPS» был
   сломан и для SSH на порт 22, который не заворачивается.
 
+## 26.10.2026: три режима, DNS через туннель, fallback, удаление
+
+**Один установщик, три режима.** `sh install.sh whitelist|proxy|dns
+["vless://..."]`; без режима — обновление с сохранением режима (прежний
+`-dns`-вариант режим в UCI не писал — установщик узнаёт его по
+`@vless4_dns` в nft-файле). CLI и init теперь общие: всё, что раньше
+отличало `vless-tunnel-dns`, — ветки по `mode == 'dns'` (нет sniffing и
+доменных правил в Xray, нет обхода сервера, sets_load для `subnets`,
+`nftset=` в dnsmasq, проверка dnsmasq-full в `doctor`). nft-правила
+собирает `vless-tunnel _apply-nft` из шаблона в `/usr/share/vless-tunnel/`
+под текущий режим одной транзакцией (`destroy chain/set` + объявление
+заново в одном `nft -f`: либо всё, либо ничего); `vless-tunnel mode`
+вызывает его, когда меняется «семейство» (sniffing ↔ dns). Ручные
+`vless4_bypass`/`vless6_bypass` при этом не пересоздаются — их объявления
+в обоих шаблонах теперь одинаковые. `install.sh proxy` сам качает
+`geoip.dat`. Исправлен баг с пустой архитектурой в предупреждении
+(`DISTRIB_ARCH` вместо несуществующей `OPENWRT_ARCH`).
+
+**Замена dnsmasq на dnsmasq-full больше не роняет DNS/DHCP** (открытый
+вопрос от 25.10 закрыт). `apk add --cache-dir … --cache-predownload
+dnsmasq-full` (apk-tools 3.0.5) скачивает все 6 пакетов до начала
+транзакции; на время замены `/etc/resolv.conf` смотрит на DNS провайдера
+(из `resolv.conf.auto`), после — возвращается; если dnsmasq всё-таки
+пропал, ставится обратно обычный, пока резолвер ещё прямой. Проверено на
+стенде ровно в сценарии бага (`resolv.conf` → 127.0.0.1): «Downloading 6
+packages… Proceeding with upgrade… Purging dnsmasq», DNS и dnsmasq-full
+работают. `vless-tunnel mode dns` без dnsmasq-full отказывает с подсказкой
+`sh install.sh dns` — сам CLI dnsmasq не меняет.
+
+**DNS доменов из списка — через туннель.** Xray получил inbound `dns-in`
+(dokodemo-door на `127.0.0.1:dns_port`, по умолчанию 5359, прозрачно на
+`dns_upstream:53`, по умолчанию 1.1.1.1). `_dns-up` (init, после старта
+Xray) кладёт в conf-dir первого экземпляра dnsmasq файл
+`vless-tunnel.conf`: `server=/домен/127.0.0.1#5359` на каждый домен из
+`domains`, `server=/…/#` для `direct-domains` и домена самого сервера
+(иначе Xray искал бы адрес сервера через туннель к нему же), в режиме dns
+ещё `nftset=`. conf-dir берётся так же, как у `/etc/init.d/dnsmasq`:
+`confdir` из UCI, иначе `/tmp/dnsmasq.<секция>.d` — `dhcp` UCI не
+трогаем. Перед записью — `dnsmasq --test`, после рестарта — проверка, что
+dnsmasq жив, иначе файл убирается. `_dns-down` (stop) удаляет файл;
+рестарт службы — два рестарта dnsmasq, осознанно (зато ручной `stop` не
+оставляет DNS списка висеть на мёртвом порту).
+
+Запросы уходят через отдельный outbound `dns-proxy` — тот же сервер, но
+с XUDP (`mux: concurrency -1, xudpConcurrency 8`, TCP не мультиплексируется,
+с flow vision совместимо): dnsmasq шлёт каждый запрос с нового порта, и без
+mux каждый открывал бы своё соединение до сервера. Тег намеренно не
+начинается с `proxy`: `selector` балансера и `subjectSelector` observatory
+сравнивают по префиксу — с тегом `proxy-dns` (первая версия) балансер
+`tunnel` раздавал бы через него и обычный трафик LAN. На стенде: ~340 мс на
+запрос без mux, ~100 мс с mux (напрямую с «VPS» до 1.1.1.1 — ~54 мс).
+`userLevel 1` с `connIdle 10` — чтобы UDP-сессии не висели по 300 с. Вообще
+новое соединение через стендовый туннель стоит ~+300 мс (TLS через туннель
+0.42 с против 0.10 с напрямую) — это свойство стека XHTTP+REALITY+mlkem,
+не DNS.
+
+**Fallback.** `observatory` (проба `https://www.gstatic.com/generate_204`
+раз в 30 с, `enableConcurrency`) следит за `proxy` и `dns-proxy`; всё, что
+шло в туннель, идёт через балансеры `tunnel` (fallback → `direct`) и
+`tunnel-dns` (fallback → `dns-direct` — freedom с `redirect` на первый DNS
+провайдера из `resolv.conf.auto`). Стратегия `random`: до первой пробы
+кандидат считается живым (проверено — сразу после старта трафик в
+туннеле); `leastPing` в эти секунды отдал бы всё в direct. Без
+`enableConcurrency` observatory проверяет outbound'ы по одному за интервал
+— `proxy` и `dns-proxy` расходились до минуты. `metrics` на
+`127.0.0.1:11180` — `status`/`doctor`/веб-страница читают оттуда
+`observatory.proxy` («сервер доступен (N мс)» / «СЕРВЕР НЕДОСТУПЕН —
+туннельный трафик идёт напрямую»; когда сервер мёртв, Xray поле `alive`
+просто не пишет). UCI: `fallback`, `tunnel_dns`, `dns_port`,
+`dns_upstream`.
+
+**Удаление.** `vless-tunnel uninstall [--purge]`: служба, nft-цепочки и все
+свои сеты (включая bypass), DNS-файл dnsmasq (и прежний
+`/tmp/dnsmasq.d/vless-tunnel.conf`), `/etc/vless-tunnel`,
+`/usr/share/vless-tunnel`, UCI, init, веб-страница и сам
+`/usr/bin/vless-tunnel`; `--purge` — ещё `apk del xray-core`. Flow
+offloading возвращается как было: `install.sh` до выключения запоминает
+`saved_offload_sw/hw` в UCI. dnsmasq-full остаётся (обратная замена —
+та же опасная операция).
+
+**Проверено на стенде** (OpenWrt 25.12.6 r33311 x86-64, Xray 26.3.27):
+
+| сценарий | результат |
+|---|---|
+| `install.sh whitelist` со ссылкой, `on` | `doctor` зелёный |
+| клиент: instagram.com (провайдер стенда даёт 127.0.0.1) | 57.144.222.34 через туннель |
+| VPS остановлен | через 10–30 с «СЕРВЕР НЕДОСТУПЕН»; discord.com → direct (200), DNS списка → `dns-direct` |
+| VPS снова запущен | через 40–60 с оба outbound живы, трафик и DNS снова в туннеле (первая проба после возврата сервера иногда падает на мёртвом XHTTP-соединении, вторая проходит) |
+| журнал (info) | TCP LAN только `-> proxy`, DNS списка только `-> dns-proxy` |
+| `mode proxy` + geoip | example.com, xda-developers.com → proxy; ya.ru, vk.com → direct |
+| `install.sh dns` при `resolv.conf` → 127.0.0.1 | dnsmasq-full встал, DNS не пропал; IP instagram.com в `vless4_dns`, discord.com через TPROXY → proxy, example.com не перехватывается |
+| `mode whitelist` ↔ `mode dns` | сеты/цепочки меняются, `11-…-server.nft` убирается/возвращается, `doctor` зелёный |
+| `fw4 reload`, перезагрузка контейнера (dns) | цепочки и `subnets` на месте, `doctor` зелёный |
+| обновление со старой sniffing-версии (HEAD) без режима | режим whitelist сохранён, DNS через туннель заработал |
+| обновление со старого `install-dns.sh` без режима | распознан `dns`, учтён `confdir=/tmp/dnsmasq.d`, адреса в сете |
+| установка «с GitHub» (`VLESS_TUNNEL_BASE_URL`, локальный HTTP) | все 9 файлов сошлись по `sha256sums` |
+| `uninstall` | ни файлов, ни nft-объектов, ни `ip rule`; dnsmasq и интернет у клиента работают |
+| offload=1 до установки → `install` → `uninstall --purge` | 0/0 после установки, 1/0 после удаления, xray-core удалён |
+| 30 DNS-запросов подряд | дескрипторов Xray 16 → не копятся |
+
 ## Открытые вопросы
 
-**`install-dns.sh` может оставить роутер без DNS и DHCP (найдено
-25.10.2026, не исправлено).** При первом переходе на `-dns`-вариант
-установщик делает `apk add dnsmasq-full`. apk сначала удаляет `dnsmasq`
-(`(1/7) Purging dnsmasq`), а остальные пакеты качает уже после. На
-роутере `/etc/resolv.conf` смотрит в 127.0.0.1, то есть в тот самый
-dnsmasq, — скачивание падает (`wget: exited with error 4`), и роутер
-остаётся вообще без dnsmasq: нет DNS и DHCP на весь LAN. Воспроизведено
-на стенде 25.12.6 при `resolv.conf` → 127.0.0.1; прежние проверки стенда
-этого не видели, потому что в контейнере резолв шёл через DNS Docker.
-Возможное исправление — сначала скачать пакеты (`apk fetch` с
-зависимостями во временный каталог), потом ставить из локальных файлов;
-либо на время замены подставить публичный DNS в `resolv.conf`. Пока не
-исправлено — `install-dns.sh` на реальном роутере не запускать.
+**`install-dns.sh` мог оставить роутер без DNS и DHCP — закрыто 26.10.2026.**
+apk при замене dnsmasq на dnsmasq-full сначала удалял dnsmasq, а качал
+остальное уже после — при `resolv.conf` → 127.0.0.1 скачивание падало, и
+роутер оставался без dnsmasq. Исправлено в общем `install.sh` (режим dns):
+`--cache-predownload` + прямой резолвер на время замены, см.
+«26.10.2026: три режима…».
 
 Пункт про не-TLS/HTTP протоколы (Telegram MTProto) закрыт — см. выше
 «Telegram/MTProto — закрыто». Общий паттерн (протокол не sniff'ается →
@@ -807,7 +913,12 @@ route get <адрес>` на роутере сразу возвращает `Net
 Happy-Eyeballs-fallback на IPv4 быть не должно, хотя явно не
 хронометрировали разницу в миллисекундах.
 
-## Два независимых установщика — `install.sh` и `install-dns.sh`
+## Вариант `-dns` (с 26.10.2026 — режим `dns`): история
+
+**С 26.10.2026 отдельного установщика и отдельного CLI нет**: режим `dns`
+ставится `sh install.sh dns` и живёт в общем коде (см. «26.10.2026: три
+режима…»). Ниже — как было раньше; находки (`nftset=` одной директивой,
+ложная тревога из-за VPN на клиенте) остаются в силе.
 
 По желанию владельца проект держит оба варианта архитектуры одновременно,
 а не только текущий (sniffing-based). Не как временную ветку миграции —

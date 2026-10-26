@@ -170,6 +170,8 @@ let network = field(status, 'NETWORK=');
 let security = field(status, 'SECURITY=');
 let sni = field(status, 'SNI=');
 let routing_line = line_with(status, 'policy routing');
+let mode_line = field(status, 'режим:');
+let tunnel_line = field(status, 'туннель:');
 
 // Список доменов для textarea читаем как есть (с комментариями) —
 // прямо из файла, путь берём из UCI, а не хардкодим: `vless-tunnel domains`
@@ -215,6 +217,8 @@ if (has_link) {
 	print('<div class="row"><span>Ссылка</span><span>не задана</span></div>');
 }
 if (routing_line) print('<div class="row"><span>Перехват</span><span>' + esc(routing_line) + '</span></div>');
+if (mode_line) print('<div class="row"><span>Режим</span><span>' + esc(mode_line) + '</span></div>');
+if (tunnel_line) print('<div class="row"><span>Связь</span><span>' + esc(tunnel_line) + '</span></div>');
 print('</div>');
 
 print('<div class="card">');

@@ -5,13 +5,14 @@
 # Вся логика установки, разбора ссылки и генерации config.json живёт
 # в /usr/bin/vless-tunnel — сюда она не заползает.
 #
-# TPROXY-правила в 10-vless-tunnel.nft перехватывают весь TCP/UDP из LAN
-# безусловно (кроме приватных сетей и bypass) — решение "туннель или
-# напрямую" принимает сам Xray через routing.rules (sniffing SNI/TLS), не
-# nftables. Поэтому здесь больше нет ни dnsmasq-обвязки, ни nft-сетов под
-# domains/subnets — их место занял /usr/bin/vless-tunnel _build-config,
-# который перед каждым стартом вставляет актуальные domains/subnets (и,
-# в mode=proxy, исключения direct-domains и geoip:ru) прямо в config.json.
+# Режимы whitelist/proxy: TPROXY-правила в 10-vless-tunnel.nft перехватывают
+# весь TCP/UDP из LAN (кроме приватных сетей и bypass) — решение "туннель
+# или напрямую" принимает сам Xray через routing.rules (sniffing SNI/TLS).
+# Режим dns: в TPROXY идут только адреса из сетов — vless4/vless6 (subnets,
+# sets_load ниже) и vless4_dns/vless6_dns (наполняет dnsmasq по nftset=).
+# Перед каждым стартом /usr/bin/vless-tunnel _build-config вставляет
+# актуальные списки в config.json, после старта _dns-up отдаёт dnsmasq файл
+# с server= (DNS доменов из списка — через туннель) и, для dns, nftset=.
 
 USE_PROCD=1
 START=99
@@ -30,6 +31,8 @@ load_cfg() {
 	config_get tproxy_port main tproxy_port 12345
 	config_get fwmark      main fwmark      0x1e5
 	config_get rttable     main table       100
+	config_get mode        main mode        whitelist
+	config_get subnets     main subnets     /etc/vless-tunnel/subnets
 }
 
 route_up() {
@@ -49,6 +52,22 @@ route_down() {
 
 	while ip -6 rule del fwmark "$fwmark" lookup "$rttable" 2>/dev/null; do :; done
 	ip -6 route flush table "$rttable" 2>/dev/null
+}
+
+# Режим dns: subnets -> элементы сетов. Комментарии и пустые строки
+# выкидываем. Строки с ":" — IPv6 (в vless6), без ":" — IPv4 (в vless4).
+# На stop сеты не чистятся: без policy routing (route_down) TPROXY по
+# оставшемуся в сете IP не зависает в чёрной дыре, а идёт обычной пересылкой.
+sets_load() {
+	local elems4 elems6
+	nft flush set inet fw4 vless4 2>/dev/null
+	nft flush set inet fw4 vless6 2>/dev/null
+	[ -f "$subnets" ] || return 0
+	elems4=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$subnets" | grep -v '^$' | grep -v ':' | tr '\n' ',' | sed 's/,$//')
+	elems6=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$subnets" | grep -v '^$' | grep ':' | tr '\n' ',' | sed 's/,$//')
+	[ -n "$elems4" ] && nft add element inet fw4 vless4 "{ $elems4 }"
+	[ -n "$elems6" ] && nft add element inet fw4 vless6 "{ $elems6 }"
+	return 0
 }
 
 # Xray стартует не мгновенно, а TPROXY-правила без слушателя = чёрная дыра
@@ -101,10 +120,13 @@ service_started() {
 		return 1
 	}
 	route_up
+	[ "$mode" = "dns" ] && sets_load
+	"$BIN" _dns-up
 }
 
 stop_service() {
 	load_cfg
+	"$BIN" _dns-down
 	route_down
 }
 
